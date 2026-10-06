@@ -1,9 +1,32 @@
-CHESS TUTOR 1.5
+CHESS TUTOR 1.6
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
 
-The engine is downloaded when the page loads (Stockfish 18 first, then 17.1, then 10). The panel shows the
-name that the engine itself reports. If it does not say "Stockfish 18 confirmed", it is not running SF18.
+ENGINE
+The tutor runs the strongest Stockfish it can load, in this order:
+
+    Stockfish 19, full network   ~95 MB wasm
+    Stockfish 18, full network  ~108 MB wasm
+    Stockfish 19 / 18 / 17.1 Lite, small network   only if the full builds cannot be fetched
+    Stockfish 10 (asm.js)                          2019 build, last resort
+
+The full builds are the single-threaded ones ("-single"): the same network as the multi-threaded builds, so the
+same strength per move - they only search on one core, because multi-threaded wasm needs COOP/COEP headers that
+a chess.com page does not give a content script. The "Lite" builds (1.8 MB) carry a small network and are quite
+a bit weaker; they report a Stockfish version too, which is why the panel used to say "Stockfish 18 confirmed"
+while actually running one. They are only a fallback now, and the panel labels them as lite.
+
+The first chess.com page after install downloads the engine: unpkg first, then jsDelivr, then the npm registry
+tarball (gunzipped and unpacked in the page - it is the only mirror with no per-file size cap). The status line
+shows the mirror and the percentage while that runs. Every file is checked against the sha256 and size that the
+npm package and the v19.0.0 / v18.0.0 GitHub releases publish, and the engine's own `id name` has to agree, so a
+mirror cannot hand over a lite build or something else and have it run. The verified wasm is then kept in the
+page's Cache Storage: the next visit starts the engine from disk instead of downloading 95 MB again (if that
+cache is missing or was cleared, it simply downloads once more).
+
+The panel's engine line shows what the engine itself reported, e.g. "id name Stockfish 19 WASM by the Stockfish
+developers" plus "✓ Stockfish 19 confirmed (engine reported it)". A lite fallback says "- lite net" in the same
+line, and anything unverified is marked as such.
 
 THINK TIME (this used to be called "Max time")
 Think time is how long the AI actually thinks - for an "Analyze now" click and for every auto-play move. Set it to
@@ -58,5 +81,7 @@ closed. Bot games, analysis boards, and playing both sides yourself are what thi
 
 (dev) panel geometry is unit-tested: node tests/panel-geom.test.js
 (dev) think time / played-depth / mate + mistake policy and the search limits are unit-tested: node tests/autoplay.test.js
+(dev) which build of Stockfish is fetched first, the mirrors/fallbacks, the sha256 pins, unpacking the npm
+      tarball and the engine cache are unit-tested: node tests/engine-frame.test.js
 (dev) the panel wiring end to end (jsdom + fake UCI engine) is tested: node tests/panel-logic.test.js
       it needs jsdom once - npm install --no-save jsdom - and skips itself when jsdom is missing

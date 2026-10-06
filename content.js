@@ -37,6 +37,11 @@
   const NS = 'http://www.w3.org/2000/svg';
   const EAGER_SAFETY_MS = 2500;    // prevents an unlimited, instant search from running forever
   const POLL_MS = 600, AUTOPLAY_TICK_MS = 100;   // MutationObserver handles the immediate path; this is a fallback
+  // The engine frame downloads ~95-113 MB (the full-net Stockfish the tutor runs). It hands the bytes over and
+  // they are kept here, in the page's Cache Storage, so the next page load starts the engine from disk. The key
+  // is the file's sha256, which is what the frame verifies before running it - so the cache cannot be poisoned
+  // even though anything on this origin could write to it.
+  const ENGINE_CACHE = 'chess-tutor-engine-v1';
 
   let lastResult = null;           // { fen, lines, turn }
   let lastEloMove = null;
@@ -178,6 +183,7 @@
       this.frame = null; this.ready = false; this.busy = false; this.queued = null; this.cur = null;
       this.byDepth = {}; this.opts = {}; this.meta = null; this.waiters = []; this.collect = null;
       this.mpv = 0; this.hash = 0; this.threads = 1; this.nnue = null; this.selfTest = null;
+      this.lastStage = null; this._idle = () => {}; this._done = () => {};
     }
     async init() {
       const frame = document.createElement('iframe');
@@ -190,7 +196,11 @@
         if (e.source !== frame.contentWindow || !e.data || !e.data.ct) return;
         const d = e.data;
         if (d.error) { setStatus('Engine error: ' + d.error); if (d.fatal) this._fail(new Error(d.error)); }
-        if (d.engineName) { this.meta = d; this._loaded(); }
+        if (d.note) console.info('[Chess Tutor] ' + d.note);
+        if (d.stage) { this.lastStage = d.stage; this.onStage(d.stage); this._idle(); }
+        if (d.ctCacheGet) this.cacheGet(d);
+        if (d.ctCachePut) this.cachePut(d);
+        if (d.engineName) { this.meta = d; this._loaded(); this._done(); }
         if (d.line !== undefined) this.onLine(d.line);
       });
       const frameReady = new Promise((res, rej) => {
@@ -202,7 +212,17 @@
       });
       document.documentElement.appendChild(frame);
       await frameReady;
-      await Promise.race([loaded, new Promise((_, rej) => setTimeout(() => rej(new Error('engine download timed out')), 180000))]);
+      // The frame reports every mirror it tries and how far the download is, so waiting is measured against
+      // that: the load fails only when nothing has moved for a minute (a mirror that went quiet), not on a
+      // fixed clock that a 95 MB download would blow through.
+      await Promise.race([loaded, new Promise((_, rej) => {
+        this._idle = (ms = 90000) => {
+          clearTimeout(this._idleTimer);
+          this._idleTimer = setTimeout(() => rej(new Error('the engine download stalled (nothing moved for ' + Math.round(ms / 1000) + 's)')), ms);
+        };
+        this._done = () => { clearTimeout(this._idleTimer); this._idle = () => {}; this._done = () => {}; };
+        this._idle();
+      })]);
 
       // ---- verification + "max strength" setup ----
       (this.meta.options || []).forEach(l => { const o = L.parseOption(l); if (o) this.opts[o.name] = o; });
@@ -227,6 +247,41 @@
       this.selfTest = r && r.lines.length && /^[a-h][1-8][a-h][1-8]/.test(r.lines[0].move)
         ? { ok: true, nps: r.stats.nps, ms: Date.now() - t0 } : { ok: false };
       this.ready = true;
+    }
+    // The frame downloads the engine and reports every mirror it tries; the status line follows along, so a
+    // 95 MB first download is visibly a download and not a hang.
+    onStage(st) {
+      const mb = n => (n / 1048576).toFixed(n >= 10485760 ? 0 : 1);
+      const rate = st.rate ? ' \u00B7 ' + mb(st.rate) + '/s' : '';
+      const line = st.phase === 'cache' ? 'Starting from the cached copy (' + mb(st.loaded) + ')'
+        : st.phase === 'archive' ? st.name + ' from the npm archive: ' + st.pct + '% of ' + mb(st.total) + rate
+          : st.phase === 'check' ? 'Verifying ' + st.name + ' (sha256)...'
+            : st.phase === 'start' ? 'Starting ' + st.name + (st.bytes ? ' (' + mb(st.bytes) + ' wasm)' : '') + '...'
+              : 'Downloading ' + st.name + (st.full ? ', full net' : '') + (st.total ? ': ' + st.pct + '% of ' + mb(st.total) + rate : '...');
+      setStatus(line);
+      if (el.verify) { el.verify.className = 'warn'; el.verify.textContent = line; }
+    }
+    // Cache Storage of the page the tutor runs on: the frame asks for the wasm it is about to download and
+    // hands back what it downloaded. Both directions are best effort - no Cache Storage just means a download.
+    cacheGet(req) {
+      const reply = bytes => {
+        try { this.frame.contentWindow.postMessage({ ctCacheRes: req.id, bytes: bytes }, '*', bytes ? [bytes] : []); } catch (_) {}
+      };
+      (async () => {
+        try {
+          const cache = window.caches && await window.caches.open(ENGINE_CACHE);
+          const hit = cache && await cache.match(req.ctCacheGet);
+          reply(hit ? await hit.arrayBuffer() : null);
+        } catch (_) { reply(null); }
+      })();
+    }
+    cachePut(req) {
+      (async () => {
+        try {
+          const cache = window.caches && await window.caches.open(ENGINE_CACHE);
+          if (cache && req.bytes) await cache.put(req.ctCacheGet, new Response(req.bytes, { headers: { 'content-type': 'application/wasm' } }));
+        } catch (_) { console.info('[Chess Tutor] engine not cached (no room?): ' + (_.message || _)); }
+      })();
     }
     setHash(mb) {
       const o = this.opts.Hash;
@@ -369,15 +424,26 @@
   function showEngine() {
     if (!el.engine || !engine || !engine.meta) return;
     const m = engine.meta, id = m.idName || 'unknown engine';
-    const is18 = /stockfish\s*18/i.test(id);
+    const name = m.engineName || 'engine';
     el.engine.textContent = id;
-    if (is18 && m.verified) { el.verify.className = 'ok'; el.verify.textContent = '\u2713 Stockfish 18 confirmed (engine reported it)'; }
-    else if (/stockfish/i.test(id)) { el.verify.className = 'warn'; el.verify.textContent = '\u26A0 NOT Stockfish 18 - running ' + id; }
-    else { el.verify.className = 'warn'; el.verify.textContent = '\u26A0 Unverified engine: "' + id + '"'; }
+    // The panel only claims what the engine itself reported. The frame names the build it downloaded and says
+    // whether the engine confirmed it (`id name`), so a lite fallback is shown as one instead of as "Stockfish".
+    if (m.verified) {
+      el.verify.className = 'ok';
+      el.verify.textContent = '\u2713 ' + name + ' confirmed (engine reported it)' + (m.engineFull === false ? ' - lite net' : '');
+    } else if (/stockfish/i.test(id)) {
+      el.verify.className = 'warn';
+      el.verify.textContent = '\u26A0 Not the expected build - running ' + id;
+    } else {
+      el.verify.className = 'warn';
+      el.verify.textContent = '\u26A0 Unverified engine: "' + id + '"';
+    }
     const bits = [m.engineKind,
       'NNUE ' + (engine.nnue ? '\u2713' : '?'),
       'Hash ' + engine.hash + ' MB',
       'Threads ' + engine.threads + (engine.threads === 1 ? ' (single-thread build)' : '')];
+    if (m.bytes) bits.push((m.bytes / 1048576).toFixed(0) + ' MB engine' + (m.cached ? ' (from cache)' : ''));
+    if (m.host) bits.push('via ' + m.host);
     if (engine.selfTest) bits.push(engine.selfTest.ok ? 'self-test OK' + (engine.selfTest.nps ? ' @ ' + Math.round(engine.selfTest.nps / 1000) + ' kn/s' : '') : 'self-test FAILED');
     if (m.hash) bits.push('sha256 ' + m.hash.slice(0, 12));
     el.engdetail.textContent = bits.filter(Boolean).join(' \u00B7 ');
