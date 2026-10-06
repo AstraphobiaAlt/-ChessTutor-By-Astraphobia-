@@ -1,4 +1,4 @@
-CHESS TUTOR 1.6
+CHESS TUTOR 1.7
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
 
@@ -44,13 +44,52 @@ from, and Think time decides how long the engine searches. The status line repor
 "Thought 5.01s · played from depth 3/3 (searched to 26) · 1.9M nodes". Long think times are real CPU time in
 the tab, so a low level with a 30s window costs the same as a high one.
 
-CHECKMATE STYLE
+CHECKMATE STYLE (this really decides the move - it is not a display setting)
+All three styles pick the UCI move that auto-play sends and that "What would X play?" reports; none of them
+changes the arrows, the evaluation or the search itself. Two of them can only act on a mate the engine's own
+search actually proved (a `score mate +N` line), which is why the style can look like it does nothing in a
+position with no forced win. The third one, the hunter, is the one that changes how the engine's candidates are
+USED, so it acts in almost every position:
+
     Mate in the fewest moves   when the search proves a win, the shortest engine-verified mate is taken - even if
                                it was not line 1 of the MultiPV list. A proven mate is never traded away.
+                               No mate proven -> identical move to "Regular best move".
+    Aggressive hunter          every proven mate is taken (fewest moves first), AND it looks for that mate one
+      (checks + bait)         level deeper than the other styles: the candidate list is the level's own depth
+                               PLUS the deepest iteration the Think time reached, so a 400 ELO hunter still plays
+                               a mate in 3 that only the long search proved. With no mate on the board it plays
+                               for pressure instead of the quiet best line: a check, then a bait (a piece it
+                               leaves en prise on purpose), then a move that attacks the enemy king. Every
+                               candidate still has to stay within "Hunter risk" of the best line the engine can
+                               see, so the attack is sound rather than reckless.
     Regular best move          no mate hunting: it plays the top line of the search, which is often a long, quiet
                                win instead of the fastest one.
-What it can prove is bounded by the level's depth, so deeper mates need a higher level; Think time buys the
-search those deeper iterations. "Full engine" plus a few seconds is what finds long forced mates.
+
+HUNTER RISK (shown only while the hunter is selected)
+    Sound (0.3 pawns)          only an attacking move the engine scores within 0.3 of the best line
+    Balanced (0.6 pawns)       within 0.6
+    Very aggressive (1.2)      within 1.2 - and twice that (2.4) when the position is already +2.5 or better,
+                               which is the "the attack is winning anyway, play it" case
+    The dial is not a promise to play badly: the engine's own evaluation is the guard rail, so the hunter attacks
+    with sound moves. A bait that the engine scores as losing (say -3.0) is refused at every setting.
+
+WHAT THE HUNTER ACTUALLY DOES WITH THE ENGINE
+    - it asks for 12 MultiPV candidates instead of 5, because a bait or a checking move is usually nowhere near
+      line 1 of the search. MultiPV splits the same Think time over more lines, so each iteration is a bit
+      slower - that is the price of the style (and it is only paid while the hunter is selected).
+    - it reads the board itself (a pure attack/defence trace of the position, lib.js moveTraits) to know whether
+      a candidate gives check, offers material or points at the enemy king. The tracer only classifies moves the
+      engine already produced; chess.com's own legal-move list still decides what can be played.
+    - the natural-mistake roll is skipped in hunter mode: an attack is a decision, not an accident (a proven mate
+      was never traded away for a slip in any style).
+    - the hunter's candidates come from the deepest iteration the search reached as well as the level's own depth,
+      so the ELO level matters less while it is attacking: at 400 ELO + hunter + a 5s think time it plays the
+      attack (or the mate) that the whole 5 seconds of searching proved, not the depth-1 line. The level still
+      decides when nothing aggressive is available (then its own top line is played), and mistakes stay off.
+    - the panel says what it saw, e.g. "hunter: check + bait (3 pts offered)" or "hunter mate M3", so an unusual
+      move is explainable instead of mysterious.
+What a mate-proof can reach is bounded by how deep the search got, so deeper mates still need Think time (and the
+hunter also sees the deepest iteration the window reached). "Full engine" plus a few seconds finds long mates.
 
 NATURAL MISTAKES
     On   (default) a low level sometimes picks a reasonable-looking line from the engine's candidates instead of
@@ -80,7 +119,8 @@ Auto-playing in live games against another person is against chess.com's fair-pl
 closed. Bot games, analysis boards, and playing both sides yourself are what this is for.
 
 (dev) panel geometry is unit-tested: node tests/panel-geom.test.js
-(dev) think time / played-depth / mate + mistake policy and the search limits are unit-tested: node tests/autoplay.test.js
+(dev) think time / played-depth / mate + mistake policy, the search limits and the hunter's board trace
+      (check / bait / king attack, the risk dial, the deep-mate pool) are unit-tested: node tests/autoplay.test.js
 (dev) which build of Stockfish is fetched first, the mirrors/fallbacks, the sha256 pins, unpacking the npm
       tarball and the engine cache are unit-tested: node tests/engine-frame.test.js
 (dev) the panel wiring end to end (jsdom + fake UCI engine) is tested: node tests/panel-logic.test.js

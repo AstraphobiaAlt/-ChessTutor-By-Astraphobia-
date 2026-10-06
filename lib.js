@@ -62,6 +62,150 @@
     return p.join(' ');
   }
 
+  /* ---- board tracing: what a move DOES to the position (pure) ----
+     The aggressive Checkmate style needs to know more about a candidate move than its evaluation: does it give
+     check, does it attack the enemy king, and does it leave a piece hanging on purpose (a bait). Everything in
+     here works on the fenBoardMap piece map ('e4' -> 'N' white, 'e5' -> 'p' black), the same board the tutor
+     already builds for SAN / arrows: no engine round trip and no legal-move generation - attacks are geometry
+     plus blocking pieces, and a "bait" is a piece that is attacked and not defended after the move. Nothing here
+     claims a move is LEGAL: the engine's candidate list decides what a candidate is (chooseMove) and chess.com's
+     board decides what is playable (content.js). */
+  var PIECE_WORTH = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+  var fileOf = sq => sq.charCodeAt(0) - 97;
+  var rankOf = sq => +sq[1] - 1;
+  var sqName = (f, r) => 'abcdefgh'[f] + (r + 1);
+  var onBoard = (f, r) => f >= 0 && f < 8 && r >= 0 && r < 8;
+  var typeOf = pc => pc ? pc.toUpperCase() : '';              // 'N' and 'n' are both a knight
+  var sideOf = pc => pc && pc === pc.toUpperCase() ? 'w' : 'b';   // a FEN piece: upper case is white
+  var worthOf = pc => pc ? (PIECE_WORTH[typeOf(pc).toLowerCase()] || 0) : 0;
+
+  // every square strictly between two squares that sit on one rank / file / diagonal (true when nothing is)
+  function pathClear(pieces, from, to) {
+    var df = Math.sign(fileOf(to) - fileOf(from)), dr = Math.sign(rankOf(to) - rankOf(from));
+    var f = fileOf(from) + df, r = rankOf(from) + dr;
+    while (onBoard(f, r) && sqName(f, r) !== to) {
+      if (pieces[sqName(f, r)]) return false;
+      f += df; r += dr;
+    }
+    return true;
+  }
+
+  /* Does the piece standing on `from` attack `to`? Occupancy of `to` is ignored (that is what makes it usable
+     for a king's square in check detection), but a piece never attacks its own square. */
+  function pieceAttacks(pieces, from, to) {
+    var pc = pieces[from];
+    if (!pc || from === to) return false;
+    var type = typeOf(pc), white = sideOf(pc) === 'w';
+    var df = fileOf(to) - fileOf(from), dr = rankOf(to) - rankOf(from);
+    var adf = Math.abs(df), adr = Math.abs(dr);
+    if (type === 'P') return adf === 1 && dr === (white ? 1 : -1);
+    if (type === 'N') return (adf === 1 && adr === 2) || (adf === 2 && adr === 1);
+    if (type === 'K') return adf <= 1 && adr <= 1;
+    if (type === 'R') return (adf === 0 || adr === 0) && pathClear(pieces, from, to);
+    if (type === 'B') return adf === adr && adf > 0 && pathClear(pieces, from, to);
+    if (type === 'Q') return (adf === adr || adf === 0 || adr === 0) && pathClear(pieces, from, to);
+    return false;
+  }
+
+  // is `sq` attacked by any piece of `side`? (a pawn attacks its diagonals, never the square in front of it)
+  function attackedBy(pieces, sq, side) {
+    for (var from in pieces) {
+      if (sideOf(pieces[from]) === side && pieceAttacks(pieces, from, sq)) return true;
+    }
+    return false;
+  }
+
+  function kingSquare(pieces, side) {
+    var want = side === 'w' ? 'K' : 'k';
+    for (var sq in pieces) if (pieces[sq] === want) return sq;
+    return null;
+  }
+  function sideInCheck(pieces, side) {
+    var king = kingSquare(pieces, side);
+    return !!king && attackedBy(pieces, king, side === 'w' ? 'b' : 'w');
+  }
+  // the enemy king's ring: the squares a mating net is built on (the king's own square is the check test)
+  function kingRing(pieces, side) {
+    var king = kingSquare(pieces, side);
+    if (!king) return [];
+    var kf = fileOf(king), kr = rankOf(king), out = [];
+    for (var df = -1; df <= 1; df++) for (var dr = -1; dr <= 1; dr++) {
+      if (!df && !dr) continue;
+      if (onBoard(kf + df, kr + dr)) out.push(sqName(kf + df, kr + dr));
+    }
+    return out;
+  }
+
+  /* The position after `uci`, plus what was taken. Castling moves the rook too; en passant (when the FEN
+     carries the target square) removes the pawn that is not standing on the destination. */
+  function applyMove(pieces, uci, ep) {
+    var from = uci.slice(0, 2), to = uci.slice(2, 4), promo = uci[4], pc = pieces[from];
+    if (!pc) return null;
+    var next = {};
+    for (var k in pieces) next[k] = pieces[k];
+    var captured = pieces[to] || null, capturedSq = captured ? to : null;
+    if (typeOf(pc) === 'P' && !captured && !promo && from[0] !== to[0] && ep === to) {
+      capturedSq = to[0] + from[1];
+      captured = pieces[capturedSq] || null;
+    }
+    delete next[from];
+    if (capturedSq) delete next[capturedSq];
+    next[to] = promo ? (sideOf(pc) === 'w' ? promo.toUpperCase() : promo.toLowerCase()) : pc;
+    if (typeOf(pc) === 'K' && Math.abs(fileOf(to) - fileOf(from)) === 2) {
+      var rf = to[0] === 'g' ? 'h' : 'a', rt = to[0] === 'g' ? 'f' : 'd', rank = from[1];
+      var rook = next[rf + rank];
+      if (rook) { delete next[rf + rank]; next[rt + rank] = rook; }
+    }
+    return { pieces: next, captured: captured, capturedSq: capturedSq, promotion: promo ? promo.toLowerCase() : null };
+  }
+
+  /* The most valuable piece of `side` that the opponent can take for free in a position: attacked and not
+     defended. A king never counts (it cannot be captured - that is check). */
+  function hangingValue(pieces, side) {
+    var other = side === 'w' ? 'b' : 'w', worst = 0;
+    for (var sq in pieces) {
+      var pc = pieces[sq];
+      if (sideOf(pc) !== side || typeOf(pc) === 'K') continue;
+      if (!attackedBy(pieces, sq, other)) continue;
+      if (attackedBy(pieces, sq, side)) continue;             // defended = not bait
+      var worth = worthOf(pc);
+      if (worth > worst) worst = worth;
+    }
+    return worst;
+  }
+  // does `side` have a piece pointing at the enemy king or at the squares around it?
+  function attacksKingRing(pieces, side) {
+    var ring = kingRing(pieces, side === 'w' ? 'b' : 'w');
+    for (var i = 0; i < ring.length; i++) {
+      if (attackedBy(pieces, ring[i], side)) return true;
+    }
+    return false;
+  }
+
+  /* What a candidate move is, in the terms the aggressive style decides on:
+       check      - the opponent is in check after it
+       bait       - material is offered: what the move wins is at least 2 points less than what it leaves
+                    hanging (a knight en prise for nothing is a bait, an equal trade never is)
+       kingAttack - the move points a piece at the enemy king or its ring (a mating net, check or not)
+       capture / gain / loss - the raw material ledger, so the panel can say what was offered. */
+  function moveTraits(fen, uci) {
+    if (typeof fen !== 'string' || fen.indexOf('/') < 0) return null;     // no board, nothing to trace
+    var parts = fen.split(' ');
+    var pieces = fenBoardMap(fen), turn = parts[1] === 'b' ? 'b' : 'w';
+    var them = turn === 'w' ? 'b' : 'w';
+    if (!uci || uci.length < 4 || !pieces[uci.slice(0, 2)]) return null;
+    if (pieces[uci.slice(2, 4)] && sideOf(pieces[uci.slice(2, 4)]) === turn) return null;   // own piece there
+    var mv = applyMove(pieces, uci, parts[3] && parts[3] !== '-' ? parts[3] : null);
+    if (!mv) return null;
+    var gain = worthOf(mv.captured) + (mv.promotion ? worthOf(mv.promotion) - 1 : 0);
+    var loss = hangingValue(mv.pieces, turn);
+    return {
+      check: sideInCheck(mv.pieces, them), bait: loss >= 2 && loss - gain >= 1,
+      kingAttack: attacksKingRing(mv.pieces, turn), capture: !!mv.captured,
+      gain: gain, loss: loss, piece: typeOf(pieces[uci.slice(0, 2)])
+    };
+  }
+
   function parseOption(line) {
     var m = /^option name (.+?) type (\w+)(?: default (\S*))?(?: min (-?\d+))?(?: max (-?\d+))?/.exec(line);
     if (!m) return null;
@@ -245,24 +389,111 @@
     return best;
   }
 
+  /* ---- the aggressive hunter ----
+     `aggressive` Checkmate style (mateMode 'hunter'): every proven mate is still taken first - including one that
+     only the deepest iteration of the search found, which is what `huntPool` exists for - and when there is no
+     mate, the move is chosen for pressure: checks first, then baits (a piece offered), then moves that attack the
+     enemy king. The engine's own evaluation is the guard rail: a hunter only ever picks a move from inside
+     `risk` of the best line it can see, so it attacks with sound moves instead of hanging a queen to look brave. */
+  var HUNT_RISK = { sound: 30, balanced: 60, very: 120 };   // centipawns the aggressive pick may give up
+  function huntTolerance(risk, bestValue) {
+    var tol = HUNT_RISK[risk];
+    if (!(tol > 0)) tol = HUNT_RISK.balanced;
+    // already clearly winning (+2.5 or more): a flashy attack costs less than it looks, so widen the net a bit
+    return bestValue >= 250 ? Math.round(tol * 2) : tol;
+  }
+  // mate scores are ranked above everything, and a sooner mate beats a later one
+  function lineValue(line) {
+    if (!line) return -Infinity;
+    if (line.type === 'mate') return line.score > 0 ? 100000 - line.score : -100000 + Math.abs(line.score);
+    return line.score;
+  }
+  // what the aggressive pick is worth, in points of pressure: check > bait > attack on the king > capture
+  function aggressionScore(t) {
+    if (!t) return 0;
+    return (t.check ? 10 : 0) + (t.bait ? 8 : 0) + (t.kingAttack ? 4 : 0) + (t.capture || t.gain ? 2 : 0);
+  }
+  // "check + bait (9 pts offered)" - the panel says what the hunter saw, so the move is not a mystery
+  function huntNote(t) {
+    if (!t) return '';
+    var bits = [];
+    if (t.check) bits.push('check');
+    if (t.bait) bits.push('bait' + (t.loss ? ' (' + t.loss + ' pts offered)' : ''));
+    else if (t.capture) bits.push(t.gain ? 'wins material' : 'capture');
+    if (t.kingAttack && !t.check) bits.push('attack on the king');
+    return bits.join(' + ');
+  }
+  /* One candidate list out of two: the level's own depth first (line 1 of it stays the reference for "the
+     engine's best move"), then the deepest iteration the think time reached. A move that appears in both keeps
+     the better-informed line - see deeperLine - which is what lets a 400 ELO hunter play a mate that only the
+     long search proved, and gives the aggression pick more than a handful of candidates. */
+  function huntPool(lines, deepLines, cap) {
+    var out = [], at = {}, max = cap || 24;
+    [lines, deepLines].forEach(function (arr) {
+      (arr || []).forEach(function (l) {
+        if (!l || !l.move) return;
+        var seen = at[l.move];
+        if (seen !== undefined) { out[seen] = deeperLine(out[seen], l); return; }
+        if (out.length >= max) return;
+        at[l.move] = out.length; out.push(l);
+      });
+    });
+    return out;
+  }
+  // the same move seen twice: the deeper line carries the better information, and a proven mate is never
+  // dropped in favour of a deeper line that only has a centipawn score
+  function deeperLine(a, b) {
+    if (a.type === 'mate' && a.score > 0) return a;
+    if (b.type === 'mate' && b.score > 0) return b;
+    return (b.depth || 0) > (a.depth || 0) ? b : a;
+  }
+  function huntPick(list, fen, opt) {
+    var mate = fastestMateLine(list);
+    if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: moveTraits(fen, mate.move), mistake: false };
+    var best = null;
+    list.forEach(function (l) { if (!best || lineValue(l) > lineValue(best)) best = l; });
+    var floor = lineValue(best) - huntTolerance(opt && opt.huntRisk, lineValue(best));
+    var pick = null;
+    list.forEach(function (l) {
+      var t = moveTraits(fen, l.move), score = aggressionScore(t);
+      if (!score || lineValue(l) < floor) return;               // unsound, or nothing aggressive about it
+      if (!pick || score > pick.score || (score === pick.score && lineValue(l) > lineValue(pick.line))) {
+        pick = { line: l, traits: t, score: score };
+      }
+    });
+    if (!pick) return { uci: list[0].move, line: list[0], mate: null, hunt: moveTraits(fen, list[0].move), mistake: false };
+    return { uci: pick.line.move, line: pick.line, mate: null, hunt: pick.traits, mistake: false };
+  }
+
   /* ---- which move to actually play (auto-play and "what would X play?") ----
      lines - the engine's candidate lines for the position, best first (already the strength-capped depth)
-     opt   - { elo, mistakes, mateMode, rand }
+     opt   - { elo, mistakes, mateMode, rand, fen, huntRisk }
        mateMode 'shortest' (default): a proven mate outranks everything, and among proven mates the smallest
                  positive mate score - the fewest moves - is played.
        mateMode 'normal'            : regular play, the top line of the search, no mate hunting.
+       mateMode 'hunter'            : aggressive. The fewest-move mate is taken first (from the whole pool handed
+                 in, which content.js builds from the level's depth plus the deepest iteration); with no mate, the
+                 most aggressive sound candidate is played - check, bait, then attack on the king - as long as its
+                 evaluation stays within `huntRisk` of the best line. Needs `fen` to see the board; without it
+                 the hunter behaves like 'shortest'.
        mistakes on                  : the ELO deviation roll may swap the top line for another candidate, which
                                       is what makes 400-1500 look like a person instead of a machine.
        mistakes off                 : always the best line the engine found at that level.
      A proven mate is never traded away for a random slip: while mate mode is on, the mistake roll is skipped.
-     Returns { uci, line, mate, mistake } or null when there is nothing legal to play. */
+     A hunter is never overruled by that roll either - it is a deliberate style, not an accident.
+     Returns { uci, line, mate, mistake, hunt } or null when there is nothing legal to play. */
   function chooseMove(lines, opt) {
     opt = opt || {};
     var list = (lines || []).filter(function (l) { return l && l.move; });
     if (!list.length) return null;
+    if (opt.mateMode === 'hunter') {
+      if (opt.fen) return huntPick(list, opt.fen, opt);
+      var huntMate = fastestMateLine(list);
+      if (huntMate) return { uci: huntMate.move, line: huntMate, mate: huntMate, hunt: null, mistake: false };
+    }
     if (opt.mateMode !== 'normal') {
       var mate = fastestMateLine(list);
-      if (mate) return { uci: mate.move, line: mate, mate: mate, mistake: false };
+      if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: null, mistake: false };
     }
     var best = list[0];
     if (opt.mistakes) {
@@ -270,10 +501,10 @@
       var picked = eloMove(best.move, moves, opt.elo, opt.rand);
       if (picked && picked !== best.move) {
         var alt = list.filter(function (l) { return l.move === picked; })[0] || best;
-        return { uci: picked, line: alt, mate: null, mistake: true };
+        return { uci: picked, line: alt, mate: null, hunt: null, mistake: true };
       }
     }
-    return { uci: best.move, line: best, mate: null, mistake: false };
+    return { uci: best.move, line: best, mate: null, hunt: null, mistake: false };
   }
 
   /* ---- free-floating panel geometry ----
@@ -323,7 +554,11 @@
     arrowShape: arrowShape, fmtCount: fmtCount, panelGeom: panelGeom,
     bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, fastestMateLine: fastestMateLine, searchLimits: searchLimits,
     reportDepth: reportDepth, chooseMove: chooseMove,
-    goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES };
+    goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES,
+    pieceAttacks: pieceAttacks, attackedBy: attackedBy, sideInCheck: sideInCheck, applyMove: applyMove,
+    hangingValue: hangingValue, moveTraits: moveTraits, aggressionScore: aggressionScore, huntNote: huntNote,
+    huntPool: huntPool, huntPick: huntPick, huntTolerance: huntTolerance, lineValue: lineValue,
+    deeperLine: deeperLine, HUNT_RISK: HUNT_RISK };
   root.CTLib = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

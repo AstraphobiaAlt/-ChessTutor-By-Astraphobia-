@@ -253,6 +253,10 @@ async function firstPlayedMove(t) {
     const t = await boot(Object.assign({ elo: 1200, time: 1, auto: false, autoplay: true, autoplayElo: 3200,
       mateMode: 'shortest', mistakes: false, side: 'me', open: true }, settings), plan);
     const uci = await firstPlayedMove(t);
+    // the move is logged when the request goes out, and the panel writes its "Auto-played ..." line one tick
+    // later, so wait for that line before reading the status (otherwise the test reads the analyze line and
+    // fails at random)
+    await until(() => /Auto-played|Auto-play: sent/.test(t.status()) ? true : false);
     const status = t.status(), elotxt = t.doc.querySelector('#ct-elotxt').textContent;
     t.win.close();
     return { uci, status, elotxt };
@@ -292,6 +296,55 @@ async function firstPlayedMove(t) {
     // ... and a level that only sees depth 1 keeps playing its own move when the mate sits deeper
     const r = await autoplayCase({ autoplayElo: 400, mateMode: 'shortest', mistakes: false }, MATE_PLAN);
     eq(r.uci, 'e2e4', 'a mate the level is too shallow to reach does not change what it plays');
+  }
+  {
+    // ---------- 3e. the aggressive hunter: it does reach the deep mate, and it says so ----------
+    const t = await boot(Object.assign({ elo: 1200, time: 1, auto: false, autoplay: true, autoplayElo: 400,
+      mateMode: 'hunter', huntRisk: 'very', mistakes: false, side: 'me', open: true }), MATE_PLAN);
+    const { win, doc } = t;
+    eq(await firstPlayedMove(t), 'd2d4',
+      'the hunter plays a mate only the deepest iteration proved, at a level whose own depth is 1');
+    ok(await until(() => /hunter mate M3/.test(t.status() + ' ' + doc.querySelector('#ct-elotxt').textContent)),
+      'the panel labels it as the hunter\'s mate: ' + t.status() + ' | ' + doc.querySelector('#ct-elotxt').textContent);
+    ok(t.log.cmds.indexOf('setoption name MultiPV value 12') >= 0,
+      'and the hunter asks for a wider candidate list than the other styles');
+    win.close();
+  }
+  {
+    // the panel shows what the hunter would play: headline move and arrow 1, not the quiet depth-1 top line
+    const t = await boot({ elo: 400, time: 1, auto: false, autoplay: false, mateMode: 'hunter', huntRisk: 'very',
+      mistakes: false, open: true }, MATE_PLAN);
+    const { win, doc } = t;
+    click(win, doc.querySelector('#ct-analyze'));            // auto-analyze is off in this case
+    eq(await until(() => doc.querySelector('#ct-bestmove').textContent === 'd4' ? 'd4' : false), 'd4',
+      'the headline move is the mate only the deep iteration proved, not the depth-1 best move');
+    ok(await until(() => /hunter mate M3/.test(t.status()) ? true : false),
+      'and the status says the hunter found it: ' + t.status());
+    ok(doc.querySelector('svg.ct-overlay g.ct-a0 polyline'), 'the aggressive move is the first arrow on the board');
+    win.close();
+  }
+  {
+    // the hunter must not weaken the other styles while it is off
+    const t = await boot({ elo: 1200, time: 1, auto: false, autoplay: false, mateMode: 'shortest',
+      mistakes: false, open: true }, MATE_PLAN);
+    const { win, doc } = t;
+    eq(doc.querySelector('#ct-mate').value, 'shortest', 'Checkmate style reads back the stored value');
+    eq(doc.querySelector('#ct-hunt-riskrow').style.display, 'none', 'the hunter risk dial is hidden for other styles');
+    eq(doc.querySelector('#ct-mate').options.length, 3, 'the panel offers all three checkmate styles');
+    eq(doc.querySelector('#ct-mate').options[1].value, 'hunter', 'the aggressive hunter is the new option');
+    const goBefore = t.goCount();
+    setSelect(win, doc.querySelector('#ct-mate'), 'hunter');
+    eq(doc.querySelector('#ct-hunt-riskrow').style.display, '', 'choosing the hunter reveals its risk dial');
+    eq(await until(() => t.log.store && t.log.store.mateMode === 'hunter' ? 'stored' : false), 'stored',
+      'the hunter is persisted like the other styles');
+    eq(await until(() => t.goCount() > goBefore ? t.lastGo() : false), 'go movetime 1000',
+      'and switching to it re-runs the search with the same think time');
+    eq(await until(() => t.log.cmds.indexOf('setoption name MultiPV value 12') >= 0 ? 'wide' : false), 'wide',
+      'the re-run asks for the hunter\'s candidate list');
+    setSelect(win, doc.querySelector('#ct-hunt-risk'), 'sound');
+    eq(await until(() => t.log.store && t.log.store.huntRisk === 'sound' ? 'stored' : false), 'stored',
+      'the risk setting is persisted');
+    win.close();
   }
   {
     const r = await autoplayCase({ autoplayElo: 400, time: 0, mateMode: 'normal', mistakes: false }, { depths: 4 });
