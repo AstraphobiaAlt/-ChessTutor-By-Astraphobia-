@@ -86,9 +86,11 @@
 .ct-switch input:checked { background: var(--ct-green); }
 .ct-switch input:checked::after { transform: translateX(1.1rem); background: #fff; }
 
-/* auto-play: the hint doubles as the state readout - dim while it is off, amber while the tutor is moving for you */
-#ct-speedrow { margin-top: -0.15rem; }
-#ct-speedrow.off { opacity: 0.5; }
+/* Auto-play always dispatches as soon as the engine has supplied a legal move.  The hint doubles as the
+   state readout - dim while it is off, amber while the tutor is moving for you. */
+#ct-autoplay-elorow { margin-top: -0.15rem; }
+.ct-fixed { min-height: 2rem; }
+#ct-response { color: var(--ct-green); font-size: 0.78rem; font-weight: 700; }
 #ct-autohint { margin: -0.1rem 0 0.55rem; font-size: 0.7rem; line-height: 1.35; color: var(--ct-faint); }
 #ct-autohint.on { color: var(--ct-amber); font-weight: 600; }
 
