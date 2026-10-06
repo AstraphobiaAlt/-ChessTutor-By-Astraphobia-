@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- Dev-only preview: renders the real panel.html + content.css in a plain page so the settings layout can be
+     eyeballed without loading the extension into chess.com. Static markup only - no engine, no board, no
+     auto-play (those live in content.js, which needs the chess.com page and the chrome.* extension APIs).
+     Serve the repo root and open /dev/panel-preview.html . -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess Tutor - panel preview</title>
+<link rel="stylesheet" href="../content.css">
+<style>
+  body { margin: 0; padding: 2rem; background: #454340; min-height: 100vh; }
+  #ct-panel { position: static; width: 17rem; margin: 0; max-height: none; }
+  #ct-root { display: flex; gap: 1.5rem; align-items: flex-start; flex-wrap: wrap; }
+  #preview-note { color: #cfcac4; font-size: 0.8rem; max-width: 22rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="ct-root">
+  <p id="preview-note">Loading panel.html&hellip;</p>
+</div>
+<script>
+fetch('../panel.html').then(r => r.text()).then(html => {
+  const root = document.getElementById('ct-root');
+  root.insertAdjacentHTML('afterbegin', html);
+  document.getElementById('ct-toggle').remove();
+  document.getElementById('ct-panel').classList.add('open');   // content.js normally toggles this          // the launcher belongs to chess.com, not here
+  // the read-outs content.js normally fills in, so the preview is not full of empty boxes
+  document.getElementById('ct-engine').textContent = 'Stockfish 18 (preview)';
+  document.getElementById('ct-verify').className = 'ok';
+  document.getElementById('ct-verify').textContent = '\u2713 engine line, filled by content.js in the real panel';
+  document.getElementById('ct-engdetail').textContent = 'NNUE \u00B7 Hash 128 MB \u00B7 Threads 4 \u00B7 self-test OK';
+  document.getElementById('ct-status').textContent = 'Idle - this static preview has no engine behind it';
+  document.getElementById('ct-draghint').textContent = 'Drag-to-any-wall behaviour is content.js code and is not active in this preview.';
+  document.getElementById('preview-note').textContent =
+    'Static preview of the panel markup. The live panel is injected into chess.com by content.js: it fills in ' +
+    'the engine name, the arrows on the board, and what Think time / Checkmate style / Natural mistakes do.';
+}).catch(e => {
+  document.getElementById('preview-note').textContent = 'Open this page through a web server from the repo root (fetch of ../panel.html failed: ' + e.message + ')';
+});
+</script>
+</body>
+</html>

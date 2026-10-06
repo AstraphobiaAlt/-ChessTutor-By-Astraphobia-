@@ -1,11 +1,14 @@
 /* Tests for engine limits, immediate auto-play rules, and mate selection.
    Run with: node tests/autoplay.test.js
    These pin down the user-visible promises:
-     - Max time 0 uses the first complete result
+     - Think time is how long the engine searches before it answers AND before auto-play moves, at every ELO
+     - Think time 0 uses the first complete result
+     - the answer is read from the level's depth, so a long think time does not quietly make 800 ELO play like 3200
      - a normal result is internally consistent (one settled depth)
      - every search has a finite UCI limit
-     - current auto-play has no pace wait: it performs an ELO/time-bounded search, then dispatches immediately
-     - when candidate lines contain winning mates, the shortest positive mate is selected explicitly
+     - auto-play has no extra pace wait: it thinks for the configured time, then dispatches
+     - checkmate style decides whether the shortest proven mate is taken; natural mistakes decide whether a low
+       level may swap its best line for another candidate
 */
 'use strict';
 const L = require('../lib.js');
@@ -54,14 +57,26 @@ const forced = {
 eq(L.instantDepth(forced, 5), 1, 'a depth the engine has already moved past is as complete as it will get');
 eq(L.instantDepth({ 1: { 1: { move: 'h7h8q' } } }, 5), null, 'still waiting on the very first depth');
 
-// ---- 5. what to ask the engine for
+// ---- 5. what to ask the engine for: Think time is the clock, the ELO level is the strength cap
 const base = { depth: 7, time: 8, autoplay: false, speed: 0, safetyMs: 2500 };
 let lim = L.searchLimits(base);
-eq(lim.depth, 7, 'level preset depth is kept');
-eq(lim.timeMs, 8000, 'max time becomes the movetime cap');
+eq(lim.depth, 0, 'a think time owns the clock: the level depth does not cap the search');
+eq(lim.timeMs, 8000, 'the think time becomes the movetime');
+eq(lim.playDepth, 7, 'the level depth is kept as the depth to play from');
 eq(lim.eager, false, 'a normal search waits for the engine to finish');
+ok(L.goCommand(lim).indexOf('depth') < 0, 'with a think time no depth limit is sent, so the time is really used');
+eq(L.goCommand(lim), 'go movetime 8000', '400 ELO or 2500 ELO, the engine gets the whole window');
+
+// the promise the user asked for: 5 seconds means 5 seconds at a low level too, not "as long as depth 1 takes"
+for (const [eloDepth, elo] of [[1, 400], [3, 800], [7, 1200], [22, 2500], [0, 3200]]) {
+  const l = L.searchLimits({ depth: eloDepth, time: 5, safetyMs: 2500 });
+  eq(l.timeMs, 5000, 'ELO ' + elo + ' thinks for the full 5s');
+  eq(L.goCommand(l), 'go movetime 5000', 'ELO ' + elo + ' sends the same clock as any other level');
+  eq(l.playDepth, eloDepth, 'ELO ' + elo + ' still answers from depth ' + eloDepth);
+}
 
 lim = L.searchLimits(Object.assign({}, base, { time: 0 }));
+eq(lim.depth, 7, 'think time 0 goes back to a depth-bounded instant search');
 eq(lim.timeMs, 0, 'max time 0 sends no movetime at all');
 eq(lim.eager, true, 'max time 0 is instant: first result, then stop');
 ok(L.goCommand(lim).indexOf('movetime') < 0, 'instant does not ask the engine to sit on a clock');
@@ -71,6 +86,71 @@ ok(L.goCommand(lim).indexOf('movetime') < 0, 'instant does not ask the engine to
 lim = L.searchLimits({ depth: 18, time: 8, safetyMs: 2500 });
 eq(lim.timeMs, 8000, 'current auto-play search keeps its Max time cap');
 eq(lim.eager, false, 'current auto-play waits for its configured result so it can recognize deeper mates');
+
+// ---- 5a. which depth the answer is read from: the level's, so a long think time does not make 800 ELO strong
+const dump5 = {
+  1: { 1: { move: 'a1a2' } },
+  2: { 1: { move: 'a1a2' }, 2: { move: 'b1b2' } },
+  3: { 1: { move: 'a1a2' }, 2: { move: 'b1b2' }, 3: { move: 'c1c2' } },
+  7: { 1: { move: 'h1h2' }, 2: { move: 'g1g2' }, 3: { move: 'f1f2' } },      // what the engine found later
+  8: { 1: { move: 'h1h2' }, 2: { move: 'g1g2' } }                             // half-filled iteration
+};
+eq(L.reportDepth(dump5, 3), 3, 'the 800 ELO lines are read from depth 3 even though the search went deeper');
+eq(L.reportDepth(dump5, 2), 2, 'the level depth is a ceiling, not a target to overshoot');
+eq(L.reportDepth(dump5, 0), 7, 'no strength cap: the deepest complete iteration is the answer');
+eq(L.reportDepth(dump5, 1), 1, 'a 400 ELO level plays the depth-1 line after the full think time');
+eq(L.reportDepth(dump5, 6), 3, 'if the cap falls between iterations, the deepest complete one below it is used');
+eq(L.reportDepth({ 5: { 1: { move: 'a1a2' } }, 6: { 1: { move: 'b1b2' } } }, 2), 5,
+  'a search that never reached the cap still answers with its first depth');
+eq(L.reportDepth({}, 5), null, 'no lines -> no depth');
+{
+  const d = L.reportDepth(dump5, 3);
+  eq(Object.keys(dump5[d]).length, 3, 'the reported depth carries every line, so arrows never mix depths');
+}
+
+// ---- 5b. what to actually play: checkmate style + natural mistakes
+const eq2 = (pick, uci, msg) => {
+  const got = pick && typeof pick === 'object' ? pick.uci : pick;
+  ok(got === uci, msg + ' (got ' + JSON.stringify(got) + ', want ' + uci + ')');
+};
+const pickLines = [
+  { move: 'e2e4', type: 'cp', score: 40, depth: 7 },
+  { move: 'd2d4', type: 'cp', score: 35, depth: 7 },
+  { move: 'g1f3', type: 'cp', score: 30, depth: 7 }
+];
+const matePick = [
+  { move: 'e2e4', type: 'cp', score: 900, depth: 7 },
+  { move: 'd2d4', type: 'mate', score: 3, depth: 7 },       // shortest proven mate, but not line 1
+  { move: 'a2a4', type: 'mate', score: 5, depth: 7 }
+];
+// checkmate style
+eq2(L.chooseMove(matePick, { elo: 1200, mistakes: false, mateMode: 'shortest', rand: () => 0.5 }).uci, 'd2d4',
+  'fewest moves: the shortest proven mate beats a big evaluation and the search order');
+eq2(L.chooseMove(matePick, { elo: 1200, mistakes: false, mateMode: 'normal', rand: () => 0.5 }).uci, 'e2e4',
+  'regular: the top line of the search, no mate hunting');
+eq2(L.chooseMove(pickLines, { elo: 1200, mistakes: false, mateMode: 'shortest', rand: () => 0.5 }).uci, 'e2e4',
+  'no mate on the board: mate mode changes nothing');
+ok(L.chooseMove(matePick, { elo: 1200, mistakes: false, mateMode: 'shortest' }).mate !== null,
+  'the chosen mate line is reported, so the panel can say why it was played');
+eq2(L.chooseMove([{ move: 'a2a4', type: 'mate', score: -2, depth: 8 }, { move: 'b2b4', type: 'cp', score: -50, depth: 8 }],
+  { elo: 3200, mistakes: false, mateMode: 'shortest' }).uci, 'a2a4',
+  'a mate for the opponent is not a winning mate, so the top line stays');
+// natural mistakes
+eq2(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', rand: () => 0.01 }).uci, 'e2e4',
+  'a low level with mistakes on still plays the engine move when the roll is clean');
+eq(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', rand: () => 0.5 }).mistake, true,
+  'a 400 ELO slip is flagged, so the panel can say it was a mistake');
+ok(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', rand: () => 0.5 }).uci !== 'e2e4',
+  'a low level with mistakes on does move away from the best line');
+eq(L.chooseMove(pickLines, { elo: 400, mistakes: false, mateMode: 'normal', rand: () => 0.5 }).mistake, false,
+  'with mistakes off nothing is flagged as a slip');
+eq2(L.chooseMove(pickLines, { elo: 400, mistakes: false, mateMode: 'normal', rand: () => 0.0 }).uci, 'e2e4',
+  'mistakes off: even 400 ELO plays its best line');
+eq2(L.chooseMove(pickLines, { elo: 3200, mistakes: true, mateMode: 'normal', rand: () => 0.0 }).uci, 'e2e4',
+  'full engine strength has no error rate, so mistakes on changes nothing there');
+ok(matePick.map(l => l.move).includes(L.chooseMove(matePick, { elo: 400, mistakes: true, mateMode: 'shortest', rand: () => 0.5 }).uci),
+  'a proven mate is never thrown away for a random slip');
+eq(L.chooseMove([], { elo: 400, mistakes: true }), null, 'no legal lines -> nothing to choose');
 
 // Legacy saved speed fields still parse predictably, rather than breaking an upgraded installation.
 lim = L.searchLimits(Object.assign({}, base, { autoplay: true, speed: 0 }));
