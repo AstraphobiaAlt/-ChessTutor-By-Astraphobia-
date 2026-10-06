@@ -28,6 +28,29 @@ The panel's engine line shows what the engine itself reported, e.g. "id name Sto
 developers" plus "✓ Stockfish 19 confirmed (engine reported it)". A lite fallback says "- lite net" in the same
 line, and anything unverified is marked as such.
 
+WHY IT USED TO DOWNLOAD AGAIN ON EVERY REDIRECT (fixed in 1.7)
+The frame runs in a sandbox with no origin of its own, so all it can hand the panel is the file NAME; the panel
+is what turns that into the Cache Storage key. It used to be a relative key ('./ct-engine-<sha256>.wasm'), and
+Cache Storage resolves a relative key against the page it is used on. That made one cache entry per page path:
+/game/live/12345 stored the engine as /game/live/ct-engine-<sha>.wasm, while /analysis, /play/computer and /home
+each looked somewhere else. So the moment chess.com redirected you off the game page - finishing a match, opening
+the analysis board - the tutor saw a cache miss and downloaded the full 99 MB again, and left another 99 MB copy
+behind every time. Three things fix that now:
+
+* the key is anchored on the origin, not on the page path: https://www.chess.com/ct-engine-<sha256>.wasm, so the
+  whole chess.com origin shares one copy and any redirect finds it;
+* the old copies (one per path) are deleted as soon as the right entry is written or read, giving the disk space
+  back and keeping the origin away from its storage quota;
+* the panel asks for persistent storage once per page load, so Chrome does not evict the engine under disk
+  pressure - and a slow disk read is no longer mistaken for a miss (the panel says "the file is here" before the
+  bytes, and the frame waits for them).
+
+The engine line tells you where the 99 MB came from: "(from cache)" or "(downloaded)" next to the size, plus
+"cache persistent" or "cache best-effort (browser may evict it)", and "not cached: <reason>" if the browser
+refused to store it. If a download still happens, that line is the answer: a new engine build (a version bump)
+legitimately downloads once, clearing chess.com's site data drops the cached copy, a private/incognito window
+never keeps one, and a full disk makes it best-effort.
+
 THINK TIME (this used to be called "Max time")
 Think time is how long the AI actually thinks - for an "Analyze now" click and for every auto-play move. Set it to
 5 seconds and the engine searches for 5 seconds, then answers / plays. Set it to 0.3 and it thinks for 0.3s.
@@ -123,5 +146,7 @@ closed. Bot games, analysis boards, and playing both sides yourself are what thi
       (check / bait / king attack, the risk dial, the deep-mate pool) are unit-tested: node tests/autoplay.test.js
 (dev) which build of Stockfish is fetched first, the mirrors/fallbacks, the sha256 pins, unpacking the npm
       tarball and the engine cache are unit-tested: node tests/engine-frame.test.js
+(dev) the engine cache surviving a redirect (one copy per origin, path-keyed duplicates pruned, the two-step
+      cache answer) is integration-tested: node tests/panel-logic.test.js
 (dev) the panel wiring end to end (jsdom + fake UCI engine) is tested: node tests/panel-logic.test.js
       it needs jsdom once - npm install --no-save jsdom - and skips itself when jsdom is missing

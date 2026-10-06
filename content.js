@@ -45,6 +45,33 @@
   // is the file's sha256, which is what the frame verifies before running it - so the cache cannot be poisoned
   // even though anything on this origin could write to it.
   const ENGINE_CACHE = 'chess-tutor-engine-v1';
+  /* The frame runs in a sandbox with no origin of its own, so all it can hand over is the file NAME - and this
+     page is what turns that into the cache key. A relative key would be resolved against whatever page the tutor
+     happens to run on: chess.com/game/live/12345, /analysis, /play/computer and /home are four different keys
+     for the same 99 MB file, so every redirect between them used to look like a cache miss, download the engine
+     again and leave another 99 MB copy behind. Keys are absolute, anchored on this page's origin only, so the
+     same file is one entry no matter which page the game ended on. */
+  const engineCacheKey = key => {
+    try { return new URL(key, location.origin + '/').href; } catch (_) { return String(key); }
+  };
+  // One copy per engine file: pre-1.7 keys were relative, so a page could end up holding several copies of the
+  // same build. Dropping the duplicates gives that disk space back and keeps the origin away from its storage
+  // quota - which is the other way a cache entry quietly disappears.
+  async function pruneEngineCache(cache, keep) {
+    const name = keep.split('/').pop();
+    const keys = await cache.keys();
+    for (const k of keys) {
+      if (k.url !== keep && k.url.split('/').pop() === name) await cache.delete(k.url);
+    }
+  }
+  // Cache Storage is "best effort" until the page asks for persistent storage: without this, Chrome may evict
+  // the entry under disk pressure, which looks exactly like the engine downloading again for no reason.
+  function askPersistentStorage() {
+    try {
+      if (!navigator.storage || !navigator.storage.persist) return Promise.resolve(null);
+      return navigator.storage.persisted().then(has => has ? true : navigator.storage.persist());
+    } catch (_) { return Promise.resolve(null); }
+  }
 
   let lastResult = null;           // { fen, lines, turn }
   let lastEloMove = null;
@@ -267,24 +294,43 @@
     }
     // Cache Storage of the page the tutor runs on: the frame asks for the wasm it is about to download and
     // hands back what it downloaded. Both directions are best effort - no Cache Storage just means a download.
+    // The frame only knows the file name, so every key goes through engineCacheKey first (origin absolute).
     cacheGet(req) {
-      const reply = bytes => {
-        try { this.frame.contentWindow.postMessage({ ctCacheRes: req.id, bytes: bytes }, '*', bytes ? [bytes] : []); } catch (_) {}
+      const key = engineCacheKey(req.ctCacheGet);
+      const post = (msg, transfer) => {
+        try { this.frame.contentWindow.postMessage(msg, '*', transfer || []); } catch (_) {}
       };
+      const answer = bytes => post({ ctCacheRes: req.id, bytes: bytes }, bytes ? [bytes] : []);
       (async () => {
         try {
           const cache = window.caches && await window.caches.open(ENGINE_CACHE);
-          const hit = cache && await cache.match(req.ctCacheGet);
-          reply(hit ? await hit.arrayBuffer() : null);
-        } catch (_) { reply(null); }
+          const hit = cache && await cache.match(key);
+          if (!hit) return answer(null);
+          // Two steps on purpose: reading 99 MB off the disk and transferring it can take longer than the
+          // frame's plain lookup window, so the file is announced before the bytes are on their way
+          // (`ctCacheFound` is what makes the frame extend its wait - engine-frame.js io.cacheGet).
+          post({ ctCacheFound: req.id });
+          const bytes = await hit.arrayBuffer();
+          answer(bytes);
+          pruneEngineCache(cache, key).catch(() => {});       // older path-keyed duplicates of this same file
+        } catch (_) { answer(null); }
       })();
     }
     cachePut(req) {
+      const key = engineCacheKey(req.ctCachePut);       // a put carries the file name in ctCachePut
       (async () => {
         try {
+          if (!req.bytes) return;
           const cache = window.caches && await window.caches.open(ENGINE_CACHE);
-          if (cache && req.bytes) await cache.put(req.ctCacheGet, new Response(req.bytes, { headers: { 'content-type': 'application/wasm' } }));
-        } catch (_) { console.info('[Chess Tutor] engine not cached (no room?): ' + (_.message || _)); }
+          if (!cache) throw new Error('Cache Storage is not available in this browser');
+          await cache.put(key, new Response(req.bytes, { headers: { 'content-type': 'application/wasm' } }));
+          this.cacheError = null;
+          await pruneEngineCache(cache, key);
+        } catch (err) {
+          this.cacheError = (err && err.message) || String(err);
+          console.info('[Chess Tutor] engine not cached (' + this.cacheError + ') - the next page load downloads again');
+        }
+        showEngine();
       })();
     }
     setHash(mb) {
@@ -451,8 +497,13 @@
       'NNUE ' + (engine.nnue ? '\u2713' : '?'),
       'Hash ' + engine.hash + ' MB',
       'Threads ' + engine.threads + (engine.threads === 1 ? ' (single-thread build)' : '')];
-    if (m.bytes) bits.push((m.bytes / 1048576).toFixed(0) + ' MB engine' + (m.cached ? ' (from cache)' : ''));
+    // Where the 99 MB came from matters to the user: "(from cache)" means the next visit is instant, and a
+    // failed or evictable cache is named here instead of being a mystery download every time.
+    if (m.bytes) bits.push((m.bytes / 1048576).toFixed(0) + ' MB engine' + (m.cached ? ' (from cache)' : ' (downloaded)'));
     if (m.host) bits.push('via ' + m.host);
+    if (engine.cachePersisted === true) bits.push('cache persistent');
+    if (engine.cachePersisted === false) bits.push('cache best-effort (browser may evict it)');
+    if (engine.cacheError) bits.push('not cached: ' + engine.cacheError);
     if (engine.selfTest) bits.push(engine.selfTest.ok ? 'self-test OK' + (engine.selfTest.nps ? ' @ ' + Math.round(engine.selfTest.nps / 1000) + ' kn/s' : '') : 'self-test FAILED');
     if (m.hash) bits.push('sha256 ' + m.hash.slice(0, 12));
     el.engdetail.textContent = bits.filter(Boolean).join(' \u00B7 ');
@@ -1036,6 +1087,8 @@
       setStatus('Loading engine...');
       el.verify.className = 'warn'; el.verify.textContent = 'Checking engine...';
       engine = e;
+      // ask for persistent storage once the panel is up, so Chrome keeps the engine instead of evicting it
+      askPersistentStorage().then(p => { e.cachePersisted = p; showEngine(); }).catch(() => {});
       await e.init();
       showEngine(); setStatus('Ready');
       if (S.auto || S.autoplay) analyze();
