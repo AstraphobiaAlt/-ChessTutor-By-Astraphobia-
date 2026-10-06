@@ -28,9 +28,12 @@
     pos: null, opacity: 100,
     // Think time (S.time) is how long Stockfish searches before it answers AND before auto-play moves, at every
     // ELO level. Auto-play has its own strength setting (autoplayElo) but shares that think time.
-    // mateMode 'shortest' = take the fewest-move forced mate the engine proved; 'normal' = the regular top line.
+    // mateMode 'shortest' = take the fewest-move forced mate the engine proved; 'normal' = the regular top line;
+    // 'hunter' = aggressive: any proven mate (including one only the deepest iteration found), otherwise the most
+    // aggressive sound candidate - check, bait, attack on the king - within huntRisk of the best line.
+    // huntRisk = how much evaluation the hunter may give up for that: sound 0.3 / balanced 0.6 / very 1.2 pawns.
     // mistakes = the low-ELO deviation roll that makes play look human instead of engine-perfect.
-    autoplay: false, autoplayElo: 3200, mateMode: 'shortest', mistakes: true
+    autoplay: false, autoplayElo: 3200, mateMode: 'shortest', huntRisk: 'very', mistakes: true
   };
   const S = Object.assign({}, DEFAULTS);
   const DEPTH_INF = 40;            // slider maximum = no strength cap: play the deepest line
@@ -42,6 +45,33 @@
   // is the file's sha256, which is what the frame verifies before running it - so the cache cannot be poisoned
   // even though anything on this origin could write to it.
   const ENGINE_CACHE = 'chess-tutor-engine-v1';
+  /* The frame runs in a sandbox with no origin of its own, so all it can hand over is the file NAME - and this
+     page is what turns that into the cache key. A relative key would be resolved against whatever page the tutor
+     happens to run on: chess.com/game/live/12345, /analysis, /play/computer and /home are four different keys
+     for the same 99 MB file, so every redirect between them used to look like a cache miss, download the engine
+     again and leave another 99 MB copy behind. Keys are absolute, anchored on this page's origin only, so the
+     same file is one entry no matter which page the game ended on. */
+  const engineCacheKey = key => {
+    try { return new URL(key, location.origin + '/').href; } catch (_) { return String(key); }
+  };
+  // One copy per engine file: pre-1.7 keys were relative, so a page could end up holding several copies of the
+  // same build. Dropping the duplicates gives that disk space back and keeps the origin away from its storage
+  // quota - which is the other way a cache entry quietly disappears.
+  async function pruneEngineCache(cache, keep) {
+    const name = keep.split('/').pop();
+    const keys = await cache.keys();
+    for (const k of keys) {
+      if (k.url !== keep && k.url.split('/').pop() === name) await cache.delete(k.url);
+    }
+  }
+  // Cache Storage is "best effort" until the page asks for persistent storage: without this, Chrome may evict
+  // the entry under disk pressure, which looks exactly like the engine downloading again for no reason.
+  function askPersistentStorage() {
+    try {
+      if (!navigator.storage || !navigator.storage.persist) return Promise.resolve(null);
+      return navigator.storage.persisted().then(has => has ? true : navigator.storage.persist());
+    } catch (_) { return Promise.resolve(null); }
+  }
 
   let lastResult = null;           // { fen, lines, turn }
   let lastEloMove = null;
@@ -65,7 +95,8 @@
     S.hash = [16, 32, 64, 128, 256].includes(S.hash) ? S.hash : 128;
     S.opacity = clamp(S.opacity, 35, 100, 100);
     S.autoplay = !!S.autoplay;
-    S.mateMode = S.mateMode === 'normal' ? 'normal' : 'shortest';   // anything unknown = chase the fewest-move mate
+    S.mateMode = ['normal', 'shortest', 'hunter'].includes(S.mateMode) ? S.mateMode : 'shortest';
+    S.huntRisk = ['sound', 'balanced', 'very'].includes(S.huntRisk) ? S.huntRisk : 'very';
     S.mistakes = S.mistakes !== false;                               // mistakes stay on unless explicitly turned off
     if (!['me', 'turn', 'w', 'b'].includes(S.side)) S.side = 'me';
     // "speed" belonged to the old paced auto-play UI. Delete it on load so every upgraded installation now has
@@ -263,24 +294,43 @@
     }
     // Cache Storage of the page the tutor runs on: the frame asks for the wasm it is about to download and
     // hands back what it downloaded. Both directions are best effort - no Cache Storage just means a download.
+    // The frame only knows the file name, so every key goes through engineCacheKey first (origin absolute).
     cacheGet(req) {
-      const reply = bytes => {
-        try { this.frame.contentWindow.postMessage({ ctCacheRes: req.id, bytes: bytes }, '*', bytes ? [bytes] : []); } catch (_) {}
+      const key = engineCacheKey(req.ctCacheGet);
+      const post = (msg, transfer) => {
+        try { this.frame.contentWindow.postMessage(msg, '*', transfer || []); } catch (_) {}
       };
+      const answer = bytes => post({ ctCacheRes: req.id, bytes: bytes }, bytes ? [bytes] : []);
       (async () => {
         try {
           const cache = window.caches && await window.caches.open(ENGINE_CACHE);
-          const hit = cache && await cache.match(req.ctCacheGet);
-          reply(hit ? await hit.arrayBuffer() : null);
-        } catch (_) { reply(null); }
+          const hit = cache && await cache.match(key);
+          if (!hit) return answer(null);
+          // Two steps on purpose: reading 99 MB off the disk and transferring it can take longer than the
+          // frame's plain lookup window, so the file is announced before the bytes are on their way
+          // (`ctCacheFound` is what makes the frame extend its wait - engine-frame.js io.cacheGet).
+          post({ ctCacheFound: req.id });
+          const bytes = await hit.arrayBuffer();
+          answer(bytes);
+          pruneEngineCache(cache, key).catch(() => {});       // older path-keyed duplicates of this same file
+        } catch (_) { answer(null); }
       })();
     }
     cachePut(req) {
+      const key = engineCacheKey(req.ctCachePut);       // a put carries the file name in ctCachePut
       (async () => {
         try {
+          if (!req.bytes) return;
           const cache = window.caches && await window.caches.open(ENGINE_CACHE);
-          if (cache && req.bytes) await cache.put(req.ctCacheGet, new Response(req.bytes, { headers: { 'content-type': 'application/wasm' } }));
-        } catch (_) { console.info('[Chess Tutor] engine not cached (no room?): ' + (_.message || _)); }
+          if (!cache) throw new Error('Cache Storage is not available in this browser');
+          await cache.put(key, new Response(req.bytes, { headers: { 'content-type': 'application/wasm' } }));
+          this.cacheError = null;
+          await pruneEngineCache(cache, key);
+        } catch (err) {
+          this.cacheError = (err && err.message) || String(err);
+          console.info('[Chess Tutor] engine not cached (' + this.cacheError + ') - the next page load downloads again');
+        }
+        showEngine();
       })();
     }
     setHash(mb) {
@@ -323,8 +373,13 @@
       const best = L.reportDepth(this.byDepth, cur.lim && cur.lim.playDepth);
       const m = (best === null ? null : this.byDepth[best]) || {};
       const lines = Object.keys(m).map(Number).sort((x, y) => x - y).map(k => m[k]);
+      const deepest = ds.length ? this.byDepth[Math.max(...ds)] : {};
+      // the deepest iteration the think time reached, as candidate lines too. Only the hunter uses them (a long
+      // think time can prove a mate a low level's own depth is nowhere near), but they are reported always so a
+      // caller can see how far the search really got.
+      const deepLines = Object.keys(deepest).map(Number).sort((x, y) => x - y).map(k => deepest[k]);
       const top = ds.length ? this.byDepth[Math.max(...ds)][1] || lines[0] : null;   // latest stats for line 1
-      cur.resolve({ lines, eager: !!eager,
+      cur.resolve({ lines, deepLines, eager: !!eager,
         // how deep the engine actually got inside the think time: the panel shows it, so a low level that thinks
         // long is visibly "searching harder than it plays" rather than looking stuck
         searchDepth: ds.length ? Math.max(...ds) : null,
@@ -442,16 +497,22 @@
       'NNUE ' + (engine.nnue ? '\u2713' : '?'),
       'Hash ' + engine.hash + ' MB',
       'Threads ' + engine.threads + (engine.threads === 1 ? ' (single-thread build)' : '')];
-    if (m.bytes) bits.push((m.bytes / 1048576).toFixed(0) + ' MB engine' + (m.cached ? ' (from cache)' : ''));
+    // Where the 99 MB came from matters to the user: "(from cache)" means the next visit is instant, and a
+    // failed or evictable cache is named here instead of being a mystery download every time.
+    if (m.bytes) bits.push((m.bytes / 1048576).toFixed(0) + ' MB engine' + (m.cached ? ' (from cache)' : ' (downloaded)'));
     if (m.host) bits.push('via ' + m.host);
+    if (engine.cachePersisted === true) bits.push('cache persistent');
+    if (engine.cachePersisted === false) bits.push('cache best-effort (browser may evict it)');
+    if (engine.cacheError) bits.push('not cached: ' + engine.cacheError);
     if (engine.selfTest) bits.push(engine.selfTest.ok ? 'self-test OK' + (engine.selfTest.nps ? ' @ ' + Math.round(engine.selfTest.nps / 1000) + ' kn/s' : '') : 'self-test FAILED');
     if (m.hash) bits.push('sha256 ' + m.hash.slice(0, 12));
     el.engdetail.textContent = bits.filter(Boolean).join(' \u00B7 ');
   }
   function updateTip() {
     const think = S.time > 0 ? 'It thinks for ' + fmtSecs(S.time) + ' per position at every level' : 'It answers instantly (first complete result)';
-    const policy = (S.mateMode === 'shortest' ? 'fewest-move mate' : 'regular best move') + ', ' +
-      (S.mistakes ? 'natural mistakes on' : 'mistakes off');
+    const policy = (S.mateMode === 'shortest' ? 'fewest-move mate'
+      : S.mateMode === 'hunter' ? 'aggressive hunter (' + huntLabel() + ')' : 'regular best move') + ', ' +
+      (S.mateMode === 'hunter' ? 'no mistake roll' : S.mistakes ? 'natural mistakes on' : 'mistakes off');
     el.tip.textContent = (S.custom
       ? 'Custom search: ' + (S.depth >= DEPTH_INF ? 'no depth limit, full strength' : 'plays the depth-' + S.depth + ' lines') + '. '
       : 'At ' + levelLabel() + ' ELO: ' + TIPS[eloKey()] + ' ') + think + ' \u00B7 ' + policy + '.';
@@ -463,7 +524,11 @@
     const timing = S.time > 0
       ? 'It thinks ' + fmtSecs(S.time) + ' for every move at any level, then plays at once - no extra delay.'
       : 'It plays the first complete result at once.';
-    const mateGoal = S.mateMode === 'shortest' ? 'A proven forced mate is taken in the fewest moves.' : 'Regular play: its best line, no mate hunting.';
+    const mateGoal = S.mateMode === 'shortest' ? 'A proven forced mate is taken in the fewest moves.'
+      : S.mateMode === 'hunter' ? 'Hunter: the fewest-move mate whenever one is proven (even if only the deepest '
+        + 'iteration found it), otherwise the most aggressive sound move - check, bait, attack on the king. Its '
+        + 'candidates come from the whole depth the search reached, so the level matters less while it attacks.'
+      : 'Regular play: its best line, no mate hunting.';
     const slip = S.mistakes ? 'Natural mistakes are on, so a low level slips like a person.' : 'Mistakes are off: it always plays its own best line.';
     el.autohint.textContent = (S.autoplay ? 'On: ' + who + ' at ' + at + '. ' : 'Off - turn on to play ' + who + ' at ' + at + '. ')
       + timing + ' ' + mateGoal + ' ' + slip;
@@ -480,6 +545,8 @@
     el.depth.value = S.depth; el.depthVal.textContent = S.depth >= DEPTH_INF ? '\u221E' : String(S.depth);
     el.time.value = S.time; el.timeVal.textContent = fmtSecs(S.time);
     el.mate.value = S.mateMode; el.mistakes.checked = S.mistakes;
+    el.huntRisk.value = S.huntRisk;
+    el.huntRiskRow.style.display = S.mateMode === 'hunter' ? '' : 'none';   // only the hunter has a risk dial
     syncDispatch();
     el.hash.value = String(S.hash);
     el.opacity.value = S.opacity; el.opacityVal.textContent = S.opacity + '%';
@@ -513,18 +580,25 @@
     if (!engine.ready) { setStatus('Engine loading...'); return; }
     const lim = limits(), t0 = Date.now();
     const strength = S.autoplay ? 'auto-play ' + autoplayLevelLabel() + ' ELO' : levelLabel() + ' ELO';
-    const goal = S.mateMode === 'shortest' ? ', preferring the shortest proven mate' : ', regular best move';
+    const goal = S.mateMode === 'shortest' ? ', preferring the shortest proven mate'
+      : S.mateMode === 'hunter' ? ', hunting mate / check / bait (' + huntLabel() + ')' : ', regular best move';
     setStatus((S.time > 0 ? 'Thinking for ' + fmtSecs(S.time) + ' (' + strength + goal + ')...' : 'Searching (' + strength + goal + ')...'));
     // Auto-play gets multiple PVs so it can choose the shortest engine-verified mating line, and so a natural
-    // mistake has real candidate moves to pick from instead of a single engine line.
-    const r = await engine.analyze(pos.fen, lim, S.autoplay ? 5 : S.showTop3 ? 3 : 1);
+    // mistake has real candidate moves to pick from instead of a single engine line. The hunter asks for more of
+    // them (plus the deepest iteration, below) because a bait is often nowhere near line 1.
+    const r = await engine.analyze(pos.fen, lim, mpvFor());
     if (!r) return;                                           // superseded by a newer request
     if (seq !== analysisSeq) return;
     const now = await readPosition();
     if (!now || now.settling || keyOf(now) !== keyOf(pos)) return;   // board changed while thinking; poll restarts
     if (!r.lines.length) { setStatus('No legal moves (game over?).'); return; }
-    lastResult = { fen: pos.fen, lines: r.lines, turn: pos.turn };
-    const top = r.lines[0];
+    const pool = huntPoolFor(r);                              // hunter: level depth + deepest iteration
+    // In hunter mode the headline move and arrow 1 ARE the hunter's choice, so what the panel shows is what the
+    // style would actually play; the engine's remaining candidates follow it. The other styles show the search.
+    const huntPickInfo = huntOn() ? L.chooseMove(pool, pickOpts(pos.fen, S.autoplay ? autoplayEloKey() : eloKey())) : null;
+    const shown = huntPickInfo ? [huntPickInfo.line].concat(pool.filter(l => l.move !== huntPickInfo.uci)) : r.lines;
+    lastResult = { fen: pos.fen, lines: shown, turn: pos.turn };
+    const top = shown[0];
     el.best.textContent = L.uciToSan(top.move, pos.fen); el.best.title = top.move;
     el.eval.textContent = L.evalText(top, pos.turn);
     setBar(top, pos.turn);
@@ -535,8 +609,16 @@
       (r.searchDepth > top.depth ? ' (searched to ' + r.searchDepth + ')' : '') + ' \u00B7 ' +
       L.fmtCount(r.stats.nodes) + ' nodes' +
       (r.stats.nps ? ' \u00B7 ' + Math.round(r.stats.nps / 1000) + ' kn/s' : '');
-    const forcedMate = L.fastestMateLine(r.lines);
+    const forcedMate = L.fastestMateLine(pool);
     if (forcedMate && S.mateMode === 'shortest') msg += ' · shortest verified mate M' + forcedMate.score;
+    else if (huntPickInfo) {
+      // say what the hunter is going for, so an unusual move is visible in the panel instead of mysterious
+      if (huntPickInfo.mate) msg += ' · hunter mate M' + huntPickInfo.mate.score +
+        (huntPickInfo.line.depth < r.searchDepth ? ' (proved at depth ' + huntPickInfo.line.depth + ')' : '');
+      else if (huntPickInfo.hunt && L.aggressionScore(huntPickInfo.hunt)) {
+        msg += ' · hunter: ' + L.huntNote(huntPickInfo.hunt) + ' (' + L.uciToSan(huntPickInfo.uci, pos.fen) + ')';
+      }
+    }
     if (r.eager) {
       msg += ' (first complete result - raise Think time for a deeper search)';
     } else {
@@ -546,7 +628,7 @@
     }
     setStatus(msg);
     render();
-    if (S.autoplay) autoPlay(pos, r.lines).catch(() => {});
+    if (S.autoplay) autoPlay(pos, pool).catch(() => {});
   }
 
   // ---------- Auto-play ----------
@@ -560,11 +642,26 @@
   const labelForPlay = () => autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
 
   // Mate mode picks the line: 'shortest' takes the fewest-move mate the engine proved, 'normal' just plays the
-  // top line at the Auto-play ELO. Natural mistakes then get the low-ELO deviation roll - skipped while a proven
-  // mate is on the board, so a forced win is never thrown away to look human. The policy lives in lib.js.
-  function pickForAutoplay(lines) {
-    return L.chooseMove(lines, { elo: autoplayEloKey(), mistakes: S.mistakes, mateMode: S.mateMode, rand: Math.random });
+  // top line at the Auto-play ELO, and 'hunter' plays the most aggressive sound candidate (see lib.js huntPick).
+  // Natural mistakes then get the low-ELO deviation roll - skipped while a proven mate is on the board and
+  // skipped in hunter mode entirely, so a forced win (or a deliberate attack) is never thrown away to look human.
+  const huntOn = () => S.mateMode === 'hunter';
+  // A bait or a checking move often sits further down the MultiPV list than line 3, so the hunter asks for more
+  // candidates. It costs search speed (MultiPV splits the same think time), which is the price of the style.
+  const MPV_HUNTER = 12;
+  const mpvFor = () => huntOn() ? MPV_HUNTER : (S.autoplay ? 5 : S.showTop3 ? 3 : 1);
+  // Hunter looks at the level's own depth AND the deepest iteration the think time reached, so a low ELO level
+  // still spots (and takes) a forced mate the long search proved. Other styles keep the level's depth promise.
+  const huntPoolFor = r => huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
+  const pickOpts = (fen, elo) => ({ elo: elo, mistakes: S.mistakes, mateMode: S.mateMode,
+    huntRisk: S.huntRisk, fen: fen, rand: Math.random });
+  const huntLabel = () => (S.huntRisk === 'sound' ? 'sound' : S.huntRisk === 'balanced' ? 'balanced' : 'very aggressive');
+
+  function pickForAutoplay(lines, fen) {
+    return L.chooseMove(lines, pickOpts(fen, autoplayEloKey()));
   }
+  // " · hunter: check + bait (3 pts offered)" - what the aggressive pick was going for
+  const huntNoteOf = pick => huntOn() && pick && pick.hunt ? L.huntNote(pick.hunt) : '';
 
   let playAttempt = null;         // { key, uci, ok, tries, at, mate, mistake }: what auto-play tried for which position
   let playing = false;
@@ -576,7 +673,7 @@
     if (!S.autoplay || playing || !engine || !engine.ready || !lines || lines.length < 1 || !ourTurn(pos)) return;
     const key = keyOf(pos);
     if (playAttempt && playAttempt.key === key && playAttempt.ok) return;      // already moved for this position
-    const choice = pickForAutoplay(lines);
+    const choice = pickForAutoplay(lines, pos.fen);
     if (!choice) return;
     // Yield only to the board/FEN request needed for stale-move protection; the move itself goes straight out.
     const now = await readPosition();
@@ -590,10 +687,14 @@
     const key = keyOf(pos);
     const prior = playAttempt && playAttempt.key === key ? playAttempt.tries : 0;
     playAttempt = { key, uci, ok: false, tries: prior + 1, at: Date.now(),
-      mate: info && info.mate ? info.mate : null, mistake: !!(info && info.mistake) };
-    const { mate, mistake } = playAttempt;
+      mate: info && info.mate ? info.mate : null, mistake: !!(info && info.mistake),
+      hunt: info && info.hunt ? info.hunt : null };
+    const { mate, mistake, hunt } = playAttempt;
     const san = L.uciToSan(uci, pos.fen);
-    const mateNote = mate ? ' · shortest verified mate M' + mate.score : '';
+    // `hunt` is only set by the hunter, so it is also what labels the move as the hunter's
+    const mateNote = mate ? (hunt ? ' · hunter mate M' + mate.score : ' · shortest verified mate M' + mate.score) : '';
+    const huntTraits = hunt && huntOn() && L.aggressionScore(hunt) ? L.huntNote(hunt) : '';
+    const huntNote = !mateNote && huntTraits ? ' · hunter: ' + huntTraits : '';
     const slipNote = mistake ? ' · natural ' + autoplayLevelLabel() + ' ELO slip' : '';
     playing = true;
     let res;
@@ -602,11 +703,11 @@
       // an API move is confirmed by the board; a synthetic click is only reported once the board confirms it
       playAttempt.ok = !!res.confirmed;
       lastEloMove = uci; render();
-      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote + slipNote;
+      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote + huntNote + slipNote;
       const when = S.time > 0 ? ' after ' + fmtSecs(S.time) + ' of thinking' : ' instantly';
       setStatus(res.confirmed
-        ? 'Auto-played ' + (res.san || san) + when + mateNote + slipNote
-        : 'Auto-play: sent ' + san + when + ' - waiting for the board to confirm it' + mateNote + slipNote);
+        ? 'Auto-played ' + (res.san || san) + when + mateNote + huntNote + slipNote
+        : 'Auto-play: sent ' + san + when + ' - waiting for the board to confirm it' + mateNote + huntNote + slipNote);
     } else {
       setStatus('Auto-play: ' + san + ' not played (' + res.reason + ')');
     }
@@ -646,20 +747,29 @@
     const base = lastResult;
     let lines = base.lines;
     if (lines.length < 3 && engine && engine.ready) {
-      const r = await engine.analyze(base.fen, limits(), 5);
+      const r = await engine.analyze(base.fen, limits(), mpvFor());
       if (!lastResult || lastResult.fen !== base.fen) return;
-      if (r && r.lines.length) lines = r.lines;
+      if (r && r.lines.length) lines = r.deepLines && huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
     }
     const eloForPick = S.custom ? 1200 : eloKey();
-    const pick = L.chooseMove(lines, { elo: eloForPick, mistakes: S.mistakes, mateMode: S.mateMode, rand: Math.random });
+    const pick = L.chooseMove(lines, pickOpts(base.fen, eloForPick));
     if (!pick) return;
     const best = lines.map(l => l.move)[0];
     lastEloMove = pick.uci;
     const san = L.uciToSan(pick.uci, base.fen), label = S.custom ? '1200' : levelLabel();
+    const huntNote = huntNoteOf(pick);
     if (pick.mate) {
       el.elotxt.textContent = san + ' (mate in ' + pick.mate.score + ' - the shortest line the engine proved)';
-      el.tip.textContent = 'Mate mode "fewest moves": any proven mate is played instead of a quieter top line. ' +
+      el.tip.textContent = (huntOn()
+        ? 'Hunter: any proven mate is taken, including one only the deepest iteration of the search found, so a '
+          + 'low level still finishes the game. '
+        : 'Mate mode "fewest moves": any proven mate is played instead of a quieter top line. ') +
         'Switch Checkmate style to Regular to let it just follow the evaluation.';
+    } else if (huntNote) {
+      el.elotxt.textContent = san + ' (hunter: ' + huntNote + ')';
+      el.tip.textContent = 'Hunter (' + huntLabel() + '): with no mate proven, the most aggressive candidate wins - '
+        + 'check, bait, then attack on the king - as long as the engine still scores it within '
+        + (S.huntRisk === 'sound' ? '0.3' : S.huntRisk === 'balanced' ? '0.6' : '1.2') + ' pawns of the best line.';
     } else if (pick.uci !== best) {
       el.elotxt.textContent = san + ' (a likely inaccuracy at ' + label + ' ELO)';
       el.tip.textContent = 'At ' + label + ' ELO, players often pick a reasonable-looking move over the best one. ' + TIPS[eloForPick];
@@ -835,6 +945,7 @@
       autoplay: q('ct-autoplay'), autoplayElo: q('ct-autoplay-elo'), autohint: q('ct-autohint'),
       depth: q('ct-depth'), depthVal: q('ct-depthval'), depthRow: q('ct-depthrow'), time: q('ct-time'), timeVal: q('ct-timeval'),
       mate: q('ct-mate'), mistakes: q('ct-mistakes'), response: q('ct-response'),
+      huntRisk: q('ct-hunt-risk'), huntRiskRow: q('ct-hunt-riskrow'),
       hash: q('ct-hash'), opacity: q('ct-opacity'), opacityVal: q('ct-opacityval'),
       analyze: q('ct-analyze'), eloBtn: q('ct-elomove'), status: q('ct-status'), best: q('ct-bestmove'), eval: q('ct-eval'),
       engine: q('ct-engine'), verify: q('ct-verify'), engdetail: q('ct-engdetail'), barfill: q('ct-barfill'),
@@ -870,7 +981,11 @@
     el.time.addEventListener('input', () => { S.time = +el.time.value; el.timeVal.textContent = fmtSecs(S.time); updateTip(); updateAutoHint(); syncDispatch(); });
     el.time.addEventListener('change', () => { saveSettings(); syncDispatch(); rerunSoon(); });
     el.mate.addEventListener('change', () => {
-      S.mateMode = el.mate.value === 'normal' ? 'normal' : 'shortest';
+      S.mateMode = ['normal', 'shortest', 'hunter'].includes(el.mate.value) ? el.mate.value : 'shortest';
+      saveSettings(); syncControls(); rerun();
+    });
+    el.huntRisk.addEventListener('change', () => {
+      S.huntRisk = ['sound', 'balanced', 'very'].includes(el.huntRisk.value) ? el.huntRisk.value : 'very';
       saveSettings(); updateTip(); updateAutoHint(); rerun();
     });
     el.mistakes.addEventListener('change', () => {
@@ -972,6 +1087,8 @@
       setStatus('Loading engine...');
       el.verify.className = 'warn'; el.verify.textContent = 'Checking engine...';
       engine = e;
+      // ask for persistent storage once the panel is up, so Chrome keeps the engine instead of evicting it
+      askPersistentStorage().then(p => { e.cachePersisted = p; showEngine(); }).catch(() => {});
       await e.init();
       showEngine(); setStatus('Ready');
       if (S.auto || S.autoplay) analyze();

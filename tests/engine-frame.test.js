@@ -364,6 +364,34 @@ const notes = messages => messages.filter(m => m.note).map(m => m.note);
     globalThis.addEventListener = realAdd; globalThis.parent = realParent;
   }
 
+  // 3k. the panel answers a cache lookup in two steps: "the file is here" and then the bytes. Reading 99 MB
+  //     off a disk is slower than answering an empty lookup, so the frame must keep waiting once it is told
+  //     something is really coming - otherwise a slow read would look like a cache miss and re-download.
+  {
+    delete require.cache[require.resolve('../engine-frame.js')];
+    const fresh = require('../engine-frame.js');
+    const listeners = [];
+    const realAdd = globalThis.addEventListener, realParent = globalThis.parent;
+    globalThis.addEventListener = (type, fn) => { if (type === 'message') listeners.push(fn); };
+    let sawLookup = null;
+    globalThis.parent = {
+      postMessage(m) {
+        if (!m.ctCacheGet) return;
+        sawLookup = m.ctCacheGet;
+        // the ack, then the bytes a moment later: the ack is what says "keep waiting"
+        setTimeout(() => listeners.forEach(fn => fn({ source: globalThis.parent, data: { ctCacheFound: m.id } })), 0);
+        setTimeout(() => listeners.forEach(fn => fn({
+          source: globalThis.parent, data: { ctCacheRes: m.id, bytes: new Uint8Array([1, 2, 3]).buffer }
+        })), 25);
+      },
+      addEventListener() {}, removeEventListener() {}
+    };
+    const got = await fresh.io.cacheGet('./ct-engine-' + 'a'.repeat(64) + '.wasm');
+    ok(sawLookup && /ct-engine-[0-9a-f]{64}\.wasm$/.test(sawLookup), 'the frame asks for the file by name: ' + sawLookup);
+    ok(got && got.byteLength === 3, 'the two-step answer really delivers the bytes to the frame');
+    globalThis.addEventListener = realAdd; globalThis.parent = realParent;
+  }
+
   console.log((failures ? 'FAILED ' : 'OK ') + checks + ' checks, ' + failures + ' failures');
   process.exit(failures ? 1 : 0);
 })();

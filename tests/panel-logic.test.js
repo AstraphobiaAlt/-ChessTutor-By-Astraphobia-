@@ -109,14 +109,20 @@ function makeEngine(win, frameWin, log, plan) {
   };
 }
 
-async function boot(settings, plan) {
+async function boot(settings, plan, opts) {
+  opts = opts || {};
   const panelHtml = fs.readFileSync(path.join(ROOT, 'panel.html'), 'utf8');
+  // the page the tutor runs on matters for the cache test: chess.com redirects a finished game to another path
   const dom = new JSDOM('<!doctype html><html><body>' + boardHtml() + '</body></html>',
-    { url: 'https://www.chess.com/analysis', runScripts: 'outside-only' });
+    { url: opts.page || 'https://www.chess.com/analysis', runScripts: 'outside-only' });
   const win = dom.window, doc = win.document;
-  const log = { cmds: [], info: [], go: [], moves: [], store: null, fen: START };
+  const log = { cmds: [], info: [], go: [], moves: [], store: null, fen: START, cacheReplies: [] };
   const planState = Object.assign({ depths: 4, mateOn: 0, mateScore: 0 }, plan);
   const engine = {};                     // handle on the fake engine, handy when a case needs debugging
+  if (opts.caches) win.caches = opts.caches;
+  if (opts.storage) win.navigator.storage = opts.storage;
+  // jsdom has no fetch/Response: the engine cache stores bytes with one, so give it a stand-in
+  if (!win.Response) win.Response = class { constructor(body) { this._b = body; } arrayBuffer() { return Promise.resolve(this._b); } };
 
   win.chrome = {
     runtime: { getURL: p => (p === 'panel.html' ? 'chrome-extension://x/panel.html' : 'about:blank') },
@@ -158,7 +164,11 @@ async function boot(settings, plan) {
     fw.__ctHooked = true;
     const eng = makeEngine(win, fw, log, planState);
     engine.api = eng;
-    fw.postMessage = m => eng.handle(m.ctCmd);
+    fw.postMessage = m => {
+      // the panel -> frame direction: a cache answer is data, everything else is a UCI command
+      if (m && (m.ctCacheRes !== undefined || m.ctCacheFound !== undefined)) { log.cacheReplies.push(m); return; }
+      eng.handle(m.ctCmd);
+    };
     win.dispatchEvent(new win.MessageEvent('message', { data: { ready: true }, source: fw }));
     eng.handle('uci');                       // the engine answers `uci` on startup
     win.dispatchEvent(new win.MessageEvent('message', {
@@ -174,6 +184,7 @@ async function boot(settings, plan) {
   }
   return {
     win, doc, log, engine, plan: planState,
+    frameWin: () => seenWin,               // the sandbox the engine runs in, as the panel sees it
     status: () => doc.querySelector('#ct-status').textContent,
     goCount: () => log.go.length,
     lastGo: () => log.go[log.go.length - 1]
@@ -253,6 +264,10 @@ async function firstPlayedMove(t) {
     const t = await boot(Object.assign({ elo: 1200, time: 1, auto: false, autoplay: true, autoplayElo: 3200,
       mateMode: 'shortest', mistakes: false, side: 'me', open: true }, settings), plan);
     const uci = await firstPlayedMove(t);
+    // the move is logged when the request goes out, and the panel writes its "Auto-played ..." line one tick
+    // later, so wait for that line before reading the status (otherwise the test reads the analyze line and
+    // fails at random)
+    await until(() => /Auto-played|Auto-play: sent/.test(t.status()) ? true : false);
     const status = t.status(), elotxt = t.doc.querySelector('#ct-elotxt').textContent;
     t.win.close();
     return { uci, status, elotxt };
@@ -292,6 +307,55 @@ async function firstPlayedMove(t) {
     // ... and a level that only sees depth 1 keeps playing its own move when the mate sits deeper
     const r = await autoplayCase({ autoplayElo: 400, mateMode: 'shortest', mistakes: false }, MATE_PLAN);
     eq(r.uci, 'e2e4', 'a mate the level is too shallow to reach does not change what it plays');
+  }
+  {
+    // ---------- 3e. the aggressive hunter: it does reach the deep mate, and it says so ----------
+    const t = await boot(Object.assign({ elo: 1200, time: 1, auto: false, autoplay: true, autoplayElo: 400,
+      mateMode: 'hunter', huntRisk: 'very', mistakes: false, side: 'me', open: true }), MATE_PLAN);
+    const { win, doc } = t;
+    eq(await firstPlayedMove(t), 'd2d4',
+      'the hunter plays a mate only the deepest iteration proved, at a level whose own depth is 1');
+    ok(await until(() => /hunter mate M3/.test(t.status() + ' ' + doc.querySelector('#ct-elotxt').textContent)),
+      'the panel labels it as the hunter\'s mate: ' + t.status() + ' | ' + doc.querySelector('#ct-elotxt').textContent);
+    ok(t.log.cmds.indexOf('setoption name MultiPV value 12') >= 0,
+      'and the hunter asks for a wider candidate list than the other styles');
+    win.close();
+  }
+  {
+    // the panel shows what the hunter would play: headline move and arrow 1, not the quiet depth-1 top line
+    const t = await boot({ elo: 400, time: 1, auto: false, autoplay: false, mateMode: 'hunter', huntRisk: 'very',
+      mistakes: false, open: true }, MATE_PLAN);
+    const { win, doc } = t;
+    click(win, doc.querySelector('#ct-analyze'));            // auto-analyze is off in this case
+    eq(await until(() => doc.querySelector('#ct-bestmove').textContent === 'd4' ? 'd4' : false), 'd4',
+      'the headline move is the mate only the deep iteration proved, not the depth-1 best move');
+    ok(await until(() => /hunter mate M3/.test(t.status()) ? true : false),
+      'and the status says the hunter found it: ' + t.status());
+    ok(doc.querySelector('svg.ct-overlay g.ct-a0 polyline'), 'the aggressive move is the first arrow on the board');
+    win.close();
+  }
+  {
+    // the hunter must not weaken the other styles while it is off
+    const t = await boot({ elo: 1200, time: 1, auto: false, autoplay: false, mateMode: 'shortest',
+      mistakes: false, open: true }, MATE_PLAN);
+    const { win, doc } = t;
+    eq(doc.querySelector('#ct-mate').value, 'shortest', 'Checkmate style reads back the stored value');
+    eq(doc.querySelector('#ct-hunt-riskrow').style.display, 'none', 'the hunter risk dial is hidden for other styles');
+    eq(doc.querySelector('#ct-mate').options.length, 3, 'the panel offers all three checkmate styles');
+    eq(doc.querySelector('#ct-mate').options[1].value, 'hunter', 'the aggressive hunter is the new option');
+    const goBefore = t.goCount();
+    setSelect(win, doc.querySelector('#ct-mate'), 'hunter');
+    eq(doc.querySelector('#ct-hunt-riskrow').style.display, '', 'choosing the hunter reveals its risk dial');
+    eq(await until(() => t.log.store && t.log.store.mateMode === 'hunter' ? 'stored' : false), 'stored',
+      'the hunter is persisted like the other styles');
+    eq(await until(() => t.goCount() > goBefore ? t.lastGo() : false), 'go movetime 1000',
+      'and switching to it re-runs the search with the same think time');
+    eq(await until(() => t.log.cmds.indexOf('setoption name MultiPV value 12') >= 0 ? 'wide' : false), 'wide',
+      'the re-run asks for the hunter\'s candidate list');
+    setSelect(win, doc.querySelector('#ct-hunt-risk'), 'sound');
+    eq(await until(() => t.log.store && t.log.store.huntRisk === 'sound' ? 'stored' : false), 'stored',
+      'the risk setting is persisted');
+    win.close();
   }
   {
     const r = await autoplayCase({ autoplayElo: 400, time: 0, mateMode: 'normal', mistakes: false }, { depths: 4 });
@@ -346,6 +410,76 @@ async function firstPlayedMove(t) {
     ok(!/mate in/.test(doc.querySelector('#ct-elotxt').textContent), 'and does not mention the mate');
     ok(/regular best move/.test(doc.querySelector('#ct-tip').textContent), 'the tip reflects the mode');
     win.close();
+  }
+
+  // ---------- 8. the engine cache survives the redirect at the end of a match ----------
+  // A finished game can land the user on another chess.com path (game -> analysis -> home). Cache Storage
+  // resolves a RELATIVE key against the page it is used on, so a key like './ct-engine-<sha>.wasm' used to mean
+  // one entry per path: every redirect was a miss and the panel downloaded the full 99 MB engine again (and
+  // left another copy behind). The key is now origin-anchored, so one download serves every page.
+  {
+    const Sha = 'a'.repeat(64);
+    const store = new Map();                       // what a real Cache Storage would hold: absolute URL -> bytes
+    // A real cache resolves the request URL against the page that asks (that is how the bug happened at all),
+    // so the stand-in does the same: the same relative key means something different on every page path.
+    const fakeCaches = page => {
+      const resolve = u => new URL(String(u), page).href;
+      const cache = {
+        async match(url) { return store.has(resolve(url)) ? new Response(store.get(resolve(url))) : undefined; },
+        async put(url, res) { store.set(resolve(url), await res.arrayBuffer()); },
+        async keys() { return [...store.keys()].map(u => ({ url: u })); },
+        async delete(url) { return store.delete(resolve(url)); }
+      };
+      return { open: async () => cache };
+    };
+    const PAGE1 = 'https://www.chess.com/game/live/12345';   // where the game was played (and the engine downloaded)
+    const PAGE2 = 'https://www.chess.com/analysis/game/live/12345';   // where finishing it can redirect to
+    const PAGE3 = 'https://www.chess.com/play/computer';
+    const KEY = './ct-engine-' + Sha + '.wasm';
+    const ABS = 'https://www.chess.com/ct-engine-' + Sha + '.wasm';
+    const OTHER = 'https://www.chess.com/analysis/game/live/12345/ct-engine-' + Sha + '.wasm';
+    const storage = { persisted: async () => false, persist: async () => true };
+
+    // a game page: the frame hands its verified download to the panel
+    const t1 = await boot({ elo: 1200, auto: false, autoplay: false, open: true }, null,
+      { page: PAGE1, caches: fakeCaches(PAGE1), storage: storage });
+    const fromFrame = (t, data) => t.win.dispatchEvent(new t.win.MessageEvent('message',
+      { data: Object.assign({ ct: true }, data), source: t.frameWin() }));
+    store.set(OTHER, new Uint8Array([9, 9]).buffer);              // an old path-keyed copy of the same file
+    fromFrame(t1, { ctCachePut: KEY, bytes: new Uint8Array([1, 2, 3]).buffer });
+    eq(await until(() => store.has(ABS) ? ABS : false), ABS,
+      'the engine is stored under an origin-absolute key, not under the page path it was downloaded on');
+    ok(await until(() => !store.has(OTHER)), 'the old path-keyed duplicate copy is dropped, giving the disk space back');
+    ok(await until(() => /cache persistent/.test(t1.doc.querySelector('#ct-engdetail').textContent)),
+      'the panel says the cache is persistent (the browser will not evict the 99 MB): ' +
+      t1.doc.querySelector('#ct-engdetail').textContent);
+    t1.win.close();
+    store.set(OTHER, new Uint8Array([9, 9]).buffer);   // and a stale path-keyed copy is back for the next case
+
+    // the redirect after the game: a different path, same origin, same engine file
+    const t2 = await boot({ elo: 1200, auto: false, autoplay: false, open: true }, null,
+      { page: PAGE2, caches: fakeCaches(PAGE2), storage: storage });
+    const answer = id => t2.log.cacheReplies.filter(r => r.ctCacheRes === id && r.bytes).pop() || null;
+    fromFrame(t2, { ctCacheGet: KEY, id: 7 });
+    const reply = await until(() => answer(7) || false);
+    ok(reply, 'the redirected page finds the engine: no re-download');
+    eq(reply && reply.bytes ? reply.bytes.byteLength : null, 3,
+      'the exact bytes the frame asked for come back (not the stale 2-byte copy under the page path)');
+    const ack = t2.log.cacheReplies.findIndex(r => r.ctCacheFound === 7);
+    const bytes = t2.log.cacheReplies.findIndex(r => r.ctCacheRes === 7 && r.bytes);
+    ok(ack >= 0 && ack < bytes,
+      'and the frame is told the file is here BEFORE the bytes are handed over (that is what lets it wait for a slow disk read)');
+    ok(await until(() => !store.has(OTHER)), 'and the stale copy is cleaned up on a cache hit too');
+    t2.win.close();
+
+    // a third page asks under the same key: it must be the cached file, not a download
+    const t3 = await boot({ elo: 1200, auto: false, autoplay: false, open: true }, null,
+      { page: PAGE3, caches: fakeCaches(PAGE3), storage: storage });
+    fromFrame(t3, { ctCacheGet: KEY, id: 8 });
+    const asked = await until(() => t3.log.cacheReplies.filter(r => r.ctCacheRes === 8 && r.bytes).pop() || false);
+    ok(asked, 'the play page hits the same cache entry');
+    eq(asked && asked.bytes ? asked.bytes.byteLength : null, 3, 'with the same bytes');
+    t3.win.close();
   }
 
   console.log((failures ? 'FAILED ' : 'OK ') + checks + ' checks, ' + failures + ' failures');

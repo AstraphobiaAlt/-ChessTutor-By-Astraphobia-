@@ -39,10 +39,19 @@
       <span id="ct-timeval" class="ct-val">5s</span>
     </div>
     <div class="ct-field">
-      <span class="ct-label" title="Fewest moves: when the engine proves a mate, auto-play takes the shortest one. Regular: it simply plays the best line of the search.">Checkmate style</span>
+      <span class="ct-label" title="Fewest moves: when the engine proves a mate, auto-play takes the shortest one. Aggressive hunter: it hunts the mate at the full depth the think time reached, and when there is no mate it plays the most aggressive sound move - checks, baits (a piece offered), attacks on the king. Regular: it simply plays the best line of the search.">Checkmate style</span>
       <select id="ct-mate" aria-label="Checkmate style">
         <option value="shortest">Mate in the fewest moves</option>
+        <option value="hunter">Aggressive hunter</option>
         <option value="normal">Regular best move</option>
+      </select>
+    </div>
+    <div class="ct-field" id="ct-hunt-riskrow">
+      <span class="ct-label" title="How much evaluation the hunter may give up for an attacking move (pawns). Every candidate still has to stay this close to the best line the engine can see, so the attack is sound: sound 0.3, balanced 0.6, very aggressive 1.2 - and twice that when the position is already clearly winning.">Hunter risk</span>
+      <select id="ct-hunt-risk" aria-label="Hunter risk">
+        <option value="sound">Sound (0.3)</option>
+        <option value="balanced">Balanced (0.6)</option>
+        <option value="very">Very aggressive (1.2)</option>
       </select>
     </div>
     <label class="ct-switch" title="On: a low ELO level sometimes picks a reasonable-looking move instead of the best one, like a real player. Off: it always plays its own best line. Never applies while a proven mate is on the board."><span>Natural mistakes</span><input type="checkbox" id="ct-mistakes"></label>

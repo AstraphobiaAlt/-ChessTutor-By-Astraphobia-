@@ -33,6 +33,11 @@ fetch('../panel.html').then(r => r.text()).then(html => {
   document.getElementById('ct-engdetail').textContent = 'NNUE \u00B7 Hash 128 MB \u00B7 Threads 4 \u00B7 self-test OK';
   document.getElementById('ct-status').textContent = 'Idle - this static preview has no engine behind it';
   document.getElementById('ct-draghint').textContent = 'Drag-to-any-wall behaviour is content.js code and is not active in this preview.';
+  // the only interactive bit worth previewing: the hunter's risk dial only exists for that Checkmate style
+  // (content.js syncControls() does exactly this in the real panel)
+  const mateSel = document.getElementById('ct-mate'), riskRow = document.getElementById('ct-hunt-riskrow');
+  const syncHunt = () => { riskRow.style.display = mateSel.value === 'hunter' ? '' : 'none'; };
+  mateSel.addEventListener('change', syncHunt); syncHunt();
   document.getElementById('preview-note').textContent =
     'Static preview of the panel markup. The live panel is injected into chess.com by content.js: it fills in ' +
     'the engine name, the arrows on the board, and what Think time / Checkmate style / Natural mistakes do.';

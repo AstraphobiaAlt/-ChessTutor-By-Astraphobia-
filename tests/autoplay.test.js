@@ -220,5 +220,121 @@ eq(L.fastestMateLine([
   { move: 'b2b4', type: 'mate', score: 3, depth: 16 }
 ]).move, 'b2b4', 'a deeper line breaks a same-distance mate tie');
 
+// ---- 10. the aggressive hunter reads the board itself: is that move a check, a bait, an attack on the king?
+// White: Ke1, Rh1, Nf3 / Black: Ke8, pawn h6. Nf3-g5 offers the knight to the h6 pawn and eyes f7.
+const HUNT_FEN = '4k3/8/7p/8/8/5N2/8/4K2R w - - 0 1';
+const jump = L.moveTraits(HUNT_FEN, 'f3g5');
+eq(jump.bait, true, 'a knight left where a pawn can take it is a bait');
+eq(jump.loss, 3, 'the bait is worth the piece that is en prise');
+eq(jump.gain, 0, 'and nothing was won for it');
+eq(jump.check, false, 'Ng5 is not a check');
+eq(jump.kingAttack, true, 'but it does point at the black king ring (f7)');
+const rookCheck = L.moveTraits(HUNT_FEN, 'h1h8');
+eq(rookCheck.check, true, 'Rh8 is a check');
+eq(rookCheck.bait, false, 'a piece nobody can take is not a bait');
+eq(rookCheck.loss, 0, 'nothing is hanging after the checking move');
+eq(L.moveTraits(HUNT_FEN, 'e1e2').kingAttack, false, 'a quiet king move is nothing special');
+eq(L.moveTraits('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1', 'e2e4').check, false,
+  'the opening move is not a check');
+// a defended knight on g5 is not a bait: the f4 pawn covers it
+eq(L.moveTraits('4k3/8/7p/8/5P2/5N2/8/4K2R w - - 0 1', 'f3g5').bait, false,
+  'a piece the opponent can take but that is defended is a trade, not a bait');
+eq(L.moveTraits(null, 'e2e4'), null, 'without a FEN there is no board to trace');
+eq(L.moveTraits(HUNT_FEN, 'a3a4'), null, 'a move with no piece on its from-square is not traced');
+eq(L.moveTraits('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1', 'a1a2'), null,
+  'and a move onto our own piece is not scored as a capture (the engine never suggests one anyway)');
+eq(L.moveTraits(HUNT_FEN, 'f3g5').piece, 'N', 'the traced move knows which piece moved');
+// attack detection itself: geometry, blocking pieces, and en passant / castling in the board map
+eq(L.pieceAttacks(L.fenBoardMap('4k3/8/8/8/8/8/8/4K2R w - - 0 1'), 'h1', 'h8'), true, 'a rook sees down an empty file');
+eq(L.pieceAttacks(L.fenBoardMap('4k3/8/8/8/8/8/8/4K2R w - - 0 1'), 'h1', 'g2'), false, 'a rook never attacks diagonally');
+eq(L.pieceAttacks(L.fenBoardMap('4k3/8/8/8/8/8/8/4K2R w - - 0 1'), 'e1', 'd2'), true, 'a king attacks one square in every direction');
+eq(L.pieceAttacks(L.fenBoardMap('4k3/8/8/8/8/8/8/4K2R w - - 0 1'), 'e1', 'e3'), false, 'and never further than that');
+eq(L.pieceAttacks(L.fenBoardMap('4k3/8/8/8/8/8/7p/4K2R w - - 0 1'), 'h1', 'h8'), false, 'a pawn blocks the file');
+eq(L.sideInCheck(L.fenBoardMap('4k3/8/8/8/8/8/8/4K2R w - - 0 1'), 'b'), false, 'no check out of nowhere');
+eq(L.sideInCheck(L.fenBoardMap('4k2R/8/8/8/8/8/8/4K3 b - - 0 1'), 'b'), true, 'the rook on h8 checks the black king');
+eq(L.applyMove(L.fenBoardMap('r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1'), 'e1g1', null).pieces.f1, 'R',
+  'castling moves the rook with the king');
+eq(L.applyMove(L.fenBoardMap('4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1'), 'e5d6', 'd6').pieces.d5, undefined,
+  'an en-passant capture removes the pawn that is not on the destination square');
+
+// ---- 11. the hunter's chosen move: pressure first, but only inside the risk it is allowed
+const huntLines = [
+  { move: 'e1e2', type: 'cp', score: 30, depth: 20 },     // best line, quiet
+  { move: 'f3g5', type: 'cp', score: 25, depth: 20 },     // the bait
+  { move: 'h1h8', type: 'cp', score: 20, depth: 20 }      // the check
+];
+const hunt = (lines, opt) => L.chooseMove(lines, Object.assign({ mateMode: 'hunter', fen: HUNT_FEN, mistakes: false }, opt));
+eq(hunt(huntLines, {}).uci, 'h1h8', 'the hunter plays the check over a slightly better quiet move (check > bait)');
+eq(hunt(huntLines, {}).hunt.check, true, 'and reports the check, so the panel can say why');
+eq(hunt(huntLines, {}).mate, null, 'no mate was proven, so nothing is claimed as one');
+eq(L.huntNote(hunt(huntLines, {}).hunt), 'check', 'the note names the check');
+eq(L.huntNote(jump), 'bait (3 pts offered) + attack on the king', 'the note explains a bait in points');
+ok(L.aggressionScore(hunt(huntLines, {}).hunt) > L.aggressionScore(jump), 'a check outranks a bait');
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'f3g5', type: 'cp', score: 25, depth: 20 }], {}).uci, 'f3g5',
+  'with no check available the bait is played');
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }], {}).uci, 'e1e2',
+  'nothing aggressive on the board: the hunter just plays the best line');
+// the guard rail: the engine's own evaluation decides how much pressure is affordable
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'h1h8', type: 'cp', score: -300, depth: 20 }], {}).uci, 'e1e2',
+  'a check the engine scores as losing is not played');
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'h1h8', type: 'cp', score: -90, depth: 20 }], { huntRisk: 'sound' }).uci, 'e1e2',
+  'sound: an attacking move 0.9 pawns down is refused');
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'h1h8', type: 'cp', score: -90, depth: 20 }], { huntRisk: 'very' }).uci, 'h1h8',
+  'very aggressive: the same move is inside the 1.2 pawn allowance');
+eq(L.huntTolerance('sound', 0), 30, 'sound = 0.3 pawns of allowed loss');
+eq(L.huntTolerance('balanced', 0), 60, 'balanced = 0.6');
+eq(L.huntTolerance('very', 0), 120, 'very aggressive = 1.2');
+eq(L.huntTolerance('very', 400), 240, 'an already winning position widens the net (the engine is still the guard)');
+const winning = [{ move: 'e1e2', type: 'cp', score: 400, depth: 20 }, { move: 'h1h8', type: 'cp', score: 300, depth: 20 }];
+eq(hunt(winning, { huntRisk: 'balanced' }).uci, 'h1h8',
+  'when the position is already +4, the net widens: a checking move 1 pawn down is affordable');
+eq(hunt(winning, { huntRisk: 'sound' }).uci, 'e1e2',
+  'but the same move is refused when the hunter is set to sound');
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'h1h8', type: 'cp', score: -70, depth: 20 }], { huntRisk: 'balanced' }).uci, 'e1e2',
+  'a pawn down in a level position is not an attack, it is a blunder: the quiet best move stays');
+// a proven mate still outranks every kind of pressure
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 900, depth: 20 }, { move: 'h1h8', type: 'mate', score: 3, depth: 20 }], {}).uci, 'h1h8',
+  'a proven mate beats any amount of attack');
+// the other styles never look at the board: only the hunter has an opinion about a check
+eq(L.chooseMove(huntLines, { mateMode: 'shortest', fen: HUNT_FEN, mistakes: false }).uci, 'e1e2',
+  'fewest-move mate style is unchanged by a FEN and a checking move');
+eq(L.chooseMove(huntLines, { mateMode: 'normal', fen: HUNT_FEN, mistakes: false }).uci, 'e1e2',
+  'regular style is unchanged by a FEN and a checking move');
+eq(L.chooseMove(huntLines, { mateMode: 'hunter', mistakes: false }).uci, 'e1e2',
+  'without a FEN the hunter falls back to the top line instead of guessing');
+// the hunter is a deliberate style: the natural-mistake roll never overrules it
+eq(L.chooseMove(huntLines, { mateMode: 'hunter', fen: HUNT_FEN, elo: 400, mistakes: true, rand: () => 0.5 }).uci, 'h1h8',
+  'a 400 ELO hunter with mistakes on still plays the attack, not a random slip');
+eq(L.chooseMove(huntLines, { mateMode: 'hunter', fen: HUNT_FEN, elo: 400, mistakes: true, rand: () => 0.5 }).mistake, false,
+  'and nothing is flagged as a slip');
+
+// ---- 12. the hunter's candidate pool: the level's depth plus the deepest iteration the think time reached.
+// That is what lets a low level play a mate its own depth never sees - the test the panel has always had
+// ("a mate the level is too shallow to reach does not change what it plays") stays true for the other styles.
+const levelLines = [{ move: 'e1e2', type: 'cp', score: 25, depth: 1 }];
+const deepLines = [
+  { move: 'e1e2', type: 'cp', score: 18, depth: 26 },
+  { move: 'h1h8', type: 'mate', score: 3, depth: 26 }
+];
+const deepPool = L.huntPool(levelLines, deepLines);
+eq(deepPool.length, 2, 'a move in both lists is only a candidate once');
+eq(deepPool[0].depth, 26, 'the deeper of two lines for the same move is the one that counts');
+eq(deepPool[1].move, 'h1h8', 'and the extra candidate the deep search found is in the pool');
+// the trap this guard exists for: the level's own depth sees nothing, and the same move is a mate deeper down
+const shadowed = L.huntPool([{ move: 'd2d4', type: 'cp', score: 20, depth: 1 }],
+  [{ move: 'd2d4', type: 'mate', score: 3, depth: 20 }]);
+eq(shadowed[0].type, 'mate', 'a mate proof replaces the shallower score for the same move');
+eq(L.chooseMove(shadowed, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very' }).mate.score, 3,
+  'so the hunter really plays it');
+const keepMate = L.huntPool([{ move: 'h1h8', type: 'mate', score: 3, depth: 10 }],
+  [{ move: 'h1h8', type: 'cp', score: 500, depth: 30 }]);
+eq(keepMate[0].type, 'mate', 'a proven mate is never dropped for a deeper line that only has a score');
+eq(L.chooseMove(levelLines, { mateMode: 'shortest', fen: HUNT_FEN, mistakes: false }).uci, 'e1e2',
+  'the other styles still answer from the level depth alone');
+eq(L.chooseMove(deepPool, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very' }).uci, 'h1h8',
+  'the hunter takes a mate that only the deepest iteration proved');
+eq(L.huntPool(levelLines, deepLines, 1).length, 1, 'the pool is capped, so a huge MultiPV list cannot blow it up');
+eq(L.huntPool([], []).length, 0, 'no lines -> no candidates');
+
 console.log((failures ? 'FAILED ' : 'OK ') + checks + ' checks, ' + failures + ' failures');
 process.exit(failures ? 1 : 0);

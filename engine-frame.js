@@ -23,8 +23,10 @@
    is rejected.
 
    The wasm is handed to the loader as a blob: URL (the loader takes its wasm from its own hash, so the
-   sandbox's CSP never has to allow the CDN), and the same bytes go to the panel, which keeps them in the
-   page's Cache Storage: the next page load starts from disk instead of downloading 95 MB again. */
+   sandbox's CSP never has to allow the CDN), and the same bytes go to the panel, which keys them on the file's
+   sha256 and on its own origin - not on the page path - so the whole chess.com origin shares one copy and the
+   next page load (or a redirect from a finished game to another page) starts from disk instead of downloading
+   95 MB again. */
 (function (root) {
   'use strict';
 
@@ -33,7 +35,9 @@
     jsMs: 45000,       // the ~21 KB loader: even a cold mirror has answered by then
     stallMs: 30000,    // no bytes for this long during a download -> that mirror is dead, try the next one
     uciMs: 150000,     // `uci` after a 99 MB wasm compile and a net init, on a cold and slow machine
-    cacheMs: 6000      // how long to wait for the panel to answer a cache lookup before just downloading
+    cacheMs: 6000,     // how long to wait for the panel to answer a cache lookup before just downloading
+    cacheReadMs: 60000 // ...and how long to wait for the bytes once the panel said the file is really there:
+                       // reading 99 MB off a disk and handing it over takes longer than an empty answer does
   };
 
   // ---------- where the files come from ----------
@@ -122,8 +126,9 @@
       return {
         name: b.name, version: b.version, kind: b.kind, full: !!b.full, expect: b.id, pkg: b.pkg,
         bytes: b.wasmBytes || 0, jsBytes: b.jsBytes || 0, wasmName: b.wasm, providers: providers,
-        // one cache entry per build, not per mirror: the panel keys it on the file hash, so a download from
-        // unpkg is reused even on a day when the tarball mirror is the only one answering
+        // one cache entry per build, not per mirror: the panel keys it on the file hash (and on its own origin,
+        // never on the page path), so a download from unpkg is reused even on a day when the tarball mirror is
+        // the only one answering - and a game page and the analysis page share the same 99 MB file
         cacheKey: b.wasmSha ? './ct-engine-' + b.wasmSha + '.wasm' : null
       };
     });
@@ -365,16 +370,21 @@
   var seq = 0;
   io.cacheGet = function (url) {
     return new Promise(function (resolve) {
-      var id = 'g' + (++seq);
+      var id = 'g' + (++seq), t = null;
       // the panel answers by posting to this frame's window, so the listener is ours, not the parent's
       function clean() { clearTimeout(t); try { root.removeEventListener('message', onMsg); } catch (e) {} }
+      function wait(ms) { clearTimeout(t); t = setTimeout(function () { clean(); resolve(null); }, ms); }
       function onMsg(e) {
-        if (e.source !== root.parent || !e.data || e.data.ctCacheRes !== id) return;
+        if (e.source !== root.parent || !e.data) return;
+        // the panel found the file: reading it off the disk and handing 99 MB over is slower than answering an
+        // empty lookup, so the wait is extended before the bytes are expected - a slow read is not a cache miss
+        if (e.data.ctCacheFound === id) return wait(TUNE.cacheReadMs);
+        if (e.data.ctCacheRes !== id) return;
         clean();
         resolve(e.data.bytes || null);
       }
-      var t = setTimeout(function () { clean(); resolve(null); }, TUNE.cacheMs);
-      try { root.addEventListener('message', onMsg); } catch (e) { clean(); return resolve(null); }
+      wait(TUNE.cacheMs);
+      try { root.addEventListener('message', onMsg); } catch (e) { return resolve(null); }
       try { root.parent.postMessage({ ctCacheGet: url, id: id }, '*'); } catch (e) { clean(); resolve(null); }
     });
   };
