@@ -130,8 +130,8 @@
      bestDepth  - deepest depth that holds as many lines as any depth does, so the arrows never mix depths
                   (this is the answer for a normal search that ran to its end).
      firstDepth - shallowest depth that already holds all `want` lines: the engine's first complete answer.
-                  "Instant" (max time 0 / auto-play speed 0) uses this - there is no reason to wait for the
-                  search to finish when a usable answer is already on the table. */
+                  "Instant" (Think time 0) uses this - there is no reason to wait for the search to finish when
+                  a usable answer is already on the table. */
   function bestDepth(byDepth) {
     var ds = Object.keys(byDepth).map(Number), maxN = 0;
     ds.forEach(function (d) { maxN = Math.max(maxN, Object.keys(byDepth[d]).length); });
@@ -173,23 +173,51 @@
 
   /* ---- what to ask the engine for ----
      opt = { depth, time, autoplay, speed, safetyMs }
+       time   -> the think time, in seconds: how long the engine gets to think before it answers *or* plays.
+                 Any level, 400 ELO or full engine, is given this whole window - the search is deliberately not
+                 cut short by the strength depth, otherwise "think 5s at 800 ELO" would be over in ~30ms.
        time 0 -> first-complete-result mode: stop after a usable answer rather than waiting on a clock.
+       depth  -> the strength target (from the ELO preset). When a think time is set it does not cap the search;
+                 it becomes `playDepth`, the depth the reported / played lines are taken from. With no think
+                 time it is also the search cap, since there is no clock to fill.
        `autoplay` / `speed` are retained for configurations saved by releases before 1.4, where speed also
-       constrained the search. The current auto-play path omits both: it dispatches immediately after a normal
-       ELO/time-bounded engine result so mating lines are not discarded just to create an artificial pace.
+       constrained the search. The current auto-play path omits both.
      A search is never sent with neither a depth nor a time (a bare "go" would run forever). */
   function searchLimits(opt) {
     opt = opt || {};
     var instant = !(opt.time > 0);
-    var depth = opt.depth || 0;
+    var target = opt.depth || 0;                                  // 0 = no strength cap: play the deepest line
     var timeMs = instant ? 0 : Math.max(50, Math.round(opt.time * 1000));
     var eager = instant;
+    var depth = instant ? target : 0;                             // a think time owns the clock, not the depth
     if (opt.autoplay) {
-      if (!(opt.speed > 0)) eager = true;
-      else timeMs = timeMs ? Math.min(timeMs, Math.round(opt.speed * 1000)) : Math.round(opt.speed * 1000);
+      // legacy: speed 0 meant "dispatch the first answer", so the ELO depth was the only limit
+      if (!(opt.speed > 0)) { eager = true; if (!instant) depth = target; }
+      else {
+        timeMs = timeMs ? Math.min(timeMs, Math.round(opt.speed * 1000)) : Math.round(opt.speed * 1000);
+        depth = 0;
+      }
     }
     if (!depth && !timeMs) timeMs = opt.safetyMs > 0 ? opt.safetyMs : 2500;
-    return { depth: depth, timeMs: timeMs, eager: eager };
+    return { depth: depth, timeMs: timeMs, eager: eager, playDepth: target };
+  }
+
+  /* ---- which depth to answer from ----
+     The engine searched as long as the think time allowed and logged every iteration. `targetDepth` is the
+     strength cap from the ELO level: the answer is the deepest complete iteration at or below it, so a lower
+     level really does play its own (shallower) move even after thinking for the full window. Without a target,
+     the deepest complete iteration is the answer. */
+  function reportDepth(byDepth, targetDepth) {
+    var ds = Object.keys(byDepth).map(Number).sort(function (a, b) { return a - b; });
+    if (!ds.length) return null;
+    if (!(targetDepth > 0)) return bestDepth(byDepth);
+    var within = ds.filter(function (d) { return d <= targetDepth; });
+    if (!within.length) return ds[0];                 // never reached the cap: the first iteration is the best it has
+    var maxN = 0;
+    within.forEach(function (d) { maxN = Math.max(maxN, Object.keys(byDepth[d]).length); });
+    if (!maxN) return bestDepth(byDepth);
+    var full = within.filter(function (d) { return Object.keys(byDepth[d]).length === maxN; });
+    return full[full.length - 1];                     // deepest complete one at or below the cap
   }
   function goCommand(lim) {
     return 'go' + (lim.depth ? ' depth ' + lim.depth : '') + (lim.timeMs ? ' movetime ' + lim.timeMs : '');
@@ -215,6 +243,37 @@
     rand = rand || Math.random;
     if (chance > 0 && rand() < chance) return list[Math.floor(rand() * list.length)] || best;
     return best;
+  }
+
+  /* ---- which move to actually play (auto-play and "what would X play?") ----
+     lines - the engine's candidate lines for the position, best first (already the strength-capped depth)
+     opt   - { elo, mistakes, mateMode, rand }
+       mateMode 'shortest' (default): a proven mate outranks everything, and among proven mates the smallest
+                 positive mate score - the fewest moves - is played.
+       mateMode 'normal'            : regular play, the top line of the search, no mate hunting.
+       mistakes on                  : the ELO deviation roll may swap the top line for another candidate, which
+                                      is what makes 400-1500 look like a person instead of a machine.
+       mistakes off                 : always the best line the engine found at that level.
+     A proven mate is never traded away for a random slip: while mate mode is on, the mistake roll is skipped.
+     Returns { uci, line, mate, mistake } or null when there is nothing legal to play. */
+  function chooseMove(lines, opt) {
+    opt = opt || {};
+    var list = (lines || []).filter(function (l) { return l && l.move; });
+    if (!list.length) return null;
+    if (opt.mateMode !== 'normal') {
+      var mate = fastestMateLine(list);
+      if (mate) return { uci: mate.move, line: mate, mate: mate, mistake: false };
+    }
+    var best = list[0];
+    if (opt.mistakes) {
+      var moves = list.map(function (l) { return l.move; });
+      var picked = eloMove(best.move, moves, opt.elo, opt.rand);
+      if (picked && picked !== best.move) {
+        var alt = list.filter(function (l) { return l.move === picked; })[0] || best;
+        return { uci: picked, line: alt, mate: null, mistake: true };
+      }
+    }
+    return { uci: best.move, line: best, mate: null, mistake: false };
   }
 
   /* ---- free-floating panel geometry ----
@@ -263,6 +322,7 @@
     parseOption: parseOption, parseInfo: parseInfo, evalText: evalText, whitePct: whitePct, sqCenter: sqCenter,
     arrowShape: arrowShape, fmtCount: fmtCount, panelGeom: panelGeom,
     bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, fastestMateLine: fastestMateLine, searchLimits: searchLimits,
+    reportDepth: reportDepth, chooseMove: chooseMove,
     goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES };
   root.CTLib = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

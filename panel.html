@@ -18,7 +18,7 @@
     <div id="ct-bar"><div id="ct-barfill"></div></div>
 
     <div class="ct-field">
-      <span class="ct-label">Play level</span>
+      <span class="ct-label" title="How strong the tutor plays/analyses. It sets which depth the move comes from - it does NOT shorten the think time.">Play level</span>
       <select id="ct-level" aria-label="Play level">
         <option value="400">400 ELO</option><option value="600">600 ELO</option>
         <option value="800">800 ELO</option><option value="1000">1000 ELO</option>
@@ -34,10 +34,18 @@
       <span id="ct-depthval" class="ct-val">24</span>
     </div>
     <div class="ct-field ct-range">
-      <span class="ct-label">Max time</span>
-      <input type="range" id="ct-time" min="0" max="60" step="0.1" aria-label="Maximum thinking time in seconds, 0 means instant">
-      <span id="ct-timeval" class="ct-val">8s</span>
+      <span class="ct-label" title="How long the engine thinks - for an Analyze click and for every auto-play move, at any ELO level. 0 answers instantly.">Think time</span>
+      <input type="range" id="ct-time" min="0" max="60" step="0.1" aria-label="Seconds the engine thinks before it answers or plays; 0 means instant">
+      <span id="ct-timeval" class="ct-val">5s</span>
     </div>
+    <div class="ct-field">
+      <span class="ct-label" title="Fewest moves: when the engine proves a mate, auto-play takes the shortest one. Regular: it simply plays the best line of the search.">Checkmate style</span>
+      <select id="ct-mate" aria-label="Checkmate style">
+        <option value="shortest">Mate in the fewest moves</option>
+        <option value="normal">Regular best move</option>
+      </select>
+    </div>
+    <label class="ct-switch" title="On: a low ELO level sometimes picks a reasonable-looking move instead of the best one, like a real player. Off: it always plays its own best line. Never applies while a proven mate is on the board."><span>Natural mistakes</span><input type="checkbox" id="ct-mistakes"></label>
     <div class="ct-field">
       <span class="ct-label">Memory (hash)</span>
       <select id="ct-hash" aria-label="Hash memory">
@@ -60,7 +68,7 @@
     <label class="ct-switch"><span>Auto-analyze</span><input type="checkbox" id="ct-auto"></label>
     <label class="ct-switch"><span>Auto-play</span><input type="checkbox" id="ct-autoplay"></label>
     <div class="ct-field" id="ct-autoplay-elorow">
-      <span class="ct-label">Auto-play ELO</span>
+      <span class="ct-label" title="Strength used for auto-play only. It shares the Think time above: 400 ELO still gets the full window, it just answers from a shallower search.">Auto-play ELO</span>
       <select id="ct-autoplay-elo" aria-label="Auto-play ELO">
         <option value="400">400 ELO</option><option value="600">600 ELO</option>
         <option value="800">800 ELO</option><option value="1000">1000 ELO</option>
@@ -71,7 +79,7 @@
     </div>
     <div class="ct-field ct-fixed" id="ct-response-row">
       <span class="ct-label">Move dispatch</span>
-      <span id="ct-response">Immediate</span>
+      <span id="ct-response">After 5s thinking</span>
     </div>
     <div id="ct-autohint"></div>
     <div class="ct-field ct-range">

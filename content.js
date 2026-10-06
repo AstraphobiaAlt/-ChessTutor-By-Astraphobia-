@@ -6,7 +6,9 @@
   if (!L) { console.warn('Chess Tutor: lib.js did not load'); return; }
 
   // ---------- Config ----------
-  // depth 0 = no depth limit (search is bounded by the time slider only) = the engine's full strength for that time.
+  // The ELO presets are the strength target: the depth the answer is read from. They are not a search cap -
+  // Think time decides how long the engine actually searches, at every level. depth 0 = no strength cap at all
+  // (the deepest line of the search is played), which is what "Full engine (max)" means.
   const PRESETS = { 400: 1, 600: 2, 800: 3, 1000: 5, 1200: 7, 1500: 10, 1800: 14, 2000: 18, 2500: 22, 3200: 0 };
   const TIPS = {
     400: "Players at this level often don't see threats more than 1 move ahead.",
@@ -21,15 +23,17 @@
     3200: 'Full engine strength. The objectively best move.'
   };
   const DEFAULTS = {
-    elo: 1200, custom: false, depth: 24, time: 8, hash: 128,
+    elo: 1200, custom: false, depth: 24, time: 5, hash: 128,
     showBest: true, showTop3: true, auto: true, side: 'me', open: true,
     pos: null, opacity: 100,
-    // Auto-play has its own strength setting. It never adds a play-speed delay: it sends the selected legal
-    // move immediately after the engine completes the configured search.
-    autoplay: false, autoplayElo: 3200
+    // Think time (S.time) is how long Stockfish searches before it answers AND before auto-play moves, at every
+    // ELO level. Auto-play has its own strength setting (autoplayElo) but shares that think time.
+    // mateMode 'shortest' = take the fewest-move forced mate the engine proved; 'normal' = the regular top line.
+    // mistakes = the low-ELO deviation roll that makes play look human instead of engine-perfect.
+    autoplay: false, autoplayElo: 3200, mateMode: 'shortest', mistakes: true
   };
   const S = Object.assign({}, DEFAULTS);
-  const DEPTH_INF = 40;            // slider maximum means "no depth limit"
+  const DEPTH_INF = 40;            // slider maximum = no strength cap: play the deepest line
   const NS = 'http://www.w3.org/2000/svg';
   const EAGER_SAFETY_MS = 2500;    // prevents an unlimited, instant search from running forever
   const POLL_MS = 600, AUTOPLAY_TICK_MS = 100;   // MutationObserver handles the immediate path; this is a fallback
@@ -43,8 +47,7 @@
   let analysisSeq = 0, polling = false, mismatch = 0, pollTimer = null;
   let boardObserver = null, observedBoard = null, autoPollQueued = false, autoPollScheduled = false;
 
-  // ---------- ELO deviation (as specified; the rule itself lives in lib.js so the tests can drive it) ----------
-  const getEloMove = (bestMove, candidateMoves, elo) => L.eloMove(bestMove, candidateMoves, elo, Math.random);
+  // ---------- Move choice + formatting (the rules themselves live in lib.js so the tests can drive them) ----------
   const fmtSecs = v => v <= 0 ? 'instant' : (Math.round(v * 100) / 100) + 's';
 
   // ---------- Settings ----------
@@ -53,10 +56,12 @@
     S.elo = PRESETS[S.elo] !== undefined ? S.elo : 1200;
     S.autoplayElo = PRESETS[S.autoplayElo] !== undefined ? S.autoplayElo : 3200;
     S.depth = Math.round(clamp(S.depth, 1, DEPTH_INF, 24));
-    S.time = clamp(S.time, 0, 60, 8);          // 0 = first complete engine result; any value above it is a search cap
+    S.time = Math.round(clamp(S.time, 0, 60, 5) * 10) / 10;   // think time; 0 = first complete engine result
     S.hash = [16, 32, 64, 128, 256].includes(S.hash) ? S.hash : 128;
     S.opacity = clamp(S.opacity, 35, 100, 100);
     S.autoplay = !!S.autoplay;
+    S.mateMode = S.mateMode === 'normal' ? 'normal' : 'shortest';   // anything unknown = chase the fewest-move mate
+    S.mistakes = S.mistakes !== false;                               // mistakes stay on unless explicitly turned off
     if (!['me', 'turn', 'w', 'b'].includes(S.side)) S.side = 'me';
     // "speed" belonged to the old paced auto-play UI. Delete it on load so every upgraded installation now has
     // the same no-added-delay behavior, rather than silently retaining a stored wait.
@@ -155,8 +160,9 @@
   // ---------- Search limits ----------
   const eloKey = () => PRESETS[S.elo] !== undefined ? S.elo : 1200;
   const autoplayEloKey = () => PRESETS[S.autoplayElo] !== undefined ? S.autoplayElo : 3200;
-  // Auto-play moves immediately once a legal move is ready. That is intentionally separate from search time:
-  // the Auto-play ELO depth and Max time still give Stockfish enough information to recognize a forced mate.
+  // The ELO level is the strength target, Think time is the clock. They are separate on purpose: the engine is
+  // allowed to keep searching for the whole think time even at 400 ELO, and the move it answers/plays is then
+  // taken from that level's depth. Auto-play dispatches as soon as that search returns - no extra pacing timer.
   function limits() {
     const depth = S.autoplay
       ? PRESETS[autoplayEloKey()]
@@ -251,18 +257,22 @@
       this.settle(cur);
       if (this.queued) { const q = this.queued; this.queued = null; this.run(q); }
     }
-    // Hand the caller the lines for one settled depth (deepest one holding every line, so arrows never mix
-    // depths) plus the freshest stats for line 1. Never resolves the same job twice.
+    // Hand the caller the lines for one settled depth (the level's depth when a strength cap is set, otherwise
+    // the deepest one holding every line, so arrows never mix depths) plus the freshest stats for line 1.
+    // Never resolves the same job twice.
     settle(cur, eager) {
       if (!cur || cur.settled) return;
       cur.settled = true;
       if (cur.superseded) { cur.resolve(null); return; }
       const ds = Object.keys(this.byDepth).map(Number);
-      const best = L.bestDepth(this.byDepth);
+      const best = L.reportDepth(this.byDepth, cur.lim && cur.lim.playDepth);
       const m = (best === null ? null : this.byDepth[best]) || {};
       const lines = Object.keys(m).map(Number).sort((x, y) => x - y).map(k => m[k]);
       const top = ds.length ? this.byDepth[Math.max(...ds)][1] || lines[0] : null;   // latest stats for line 1
       cur.resolve({ lines, eager: !!eager,
+        // how deep the engine actually got inside the think time: the panel shows it, so a low level that thinks
+        // long is visibly "searching harder than it plays" rather than looking stuck
+        searchDepth: ds.length ? Math.max(...ds) : null,
         stats: top ? { depth: top.depth, nodes: top.nodes, nps: top.nps, time: top.time } : {} });
     }
     // "Instant" mode: an answer that already has every requested line needs no further searching. Also fire
@@ -373,27 +383,38 @@
     el.engdetail.textContent = bits.filter(Boolean).join(' \u00B7 ');
   }
   function updateTip() {
-    el.tip.textContent = S.custom
-      ? 'Custom search: ' + (S.depth >= DEPTH_INF ? 'no depth limit' : 'depth ' + S.depth) + ', ' +
-        (S.time <= 0 ? 'no time cap (instant: first result).' : 'up to ' + S.time + 's.')
-      : 'At ' + levelLabel() + ' ELO: ' + TIPS[eloKey()];
+    const think = S.time > 0 ? 'It thinks for ' + fmtSecs(S.time) + ' per position at every level' : 'It answers instantly (first complete result)';
+    const policy = (S.mateMode === 'shortest' ? 'fewest-move mate' : 'regular best move') + ', ' +
+      (S.mistakes ? 'natural mistakes on' : 'mistakes off');
+    el.tip.textContent = (S.custom
+      ? 'Custom search: ' + (S.depth >= DEPTH_INF ? 'no depth limit, full strength' : 'plays the depth-' + S.depth + ' lines') + '. '
+      : 'At ' + levelLabel() + ' ELO: ' + TIPS[eloKey()] + ' ') + think + ' \u00B7 ' + policy + '.';
     el.eloBtn.textContent = S.custom ? 'What would 1200 play?' : 'What would ' + levelLabel() + ' play?';
   }
   function updateAutoHint() {
     const who = S.side === 'me' ? 'your side' : S.side === 'turn' ? 'the side to move, both colours' : S.side === 'w' ? 'White' : 'Black';
     const at = autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
-    const mateGoal = 'Shortest engine-verified forced mate takes priority.';
-    const timing = 'Moves are dispatched immediately after the engine returns a legal move.';
-    el.autohint.textContent = S.autoplay
-      ? 'On: ' + who + ' at ' + at + '. ' + timing + ' ' + mateGoal
-      : 'Off - turn on to play ' + who + ' at ' + at + '. ' + mateGoal;
+    const timing = S.time > 0
+      ? 'It thinks ' + fmtSecs(S.time) + ' for every move at any level, then plays at once - no extra delay.'
+      : 'It plays the first complete result at once.';
+    const mateGoal = S.mateMode === 'shortest' ? 'A proven forced mate is taken in the fewest moves.' : 'Regular play: its best line, no mate hunting.';
+    const slip = S.mistakes ? 'Natural mistakes are on, so a low level slips like a person.' : 'Mistakes are off: it always plays its own best line.';
+    el.autohint.textContent = (S.autoplay ? 'On: ' + who + ' at ' + at + '. ' : 'Off - turn on to play ' + who + ' at ' + at + '. ')
+      + timing + ' ' + mateGoal + ' ' + slip;
     el.autohint.classList.toggle('on', S.autoplay);
+  }
+  // "Move dispatch" is a readout, not a control: auto-play has no pacing timer of its own, the only wait before
+  // a move goes out is the Think time the engine is given for that position.
+  function syncDispatch() {
+    if (el.response) el.response.textContent = S.time > 0 ? 'After ' + fmtSecs(S.time) + ' thinking' : 'Immediate (instant)';
   }
   function syncControls() {
     el.level.value = S.custom ? 'custom' : String(eloKey());
     el.depthRow.style.display = S.custom ? '' : 'none';
     el.depth.value = S.depth; el.depthVal.textContent = S.depth >= DEPTH_INF ? '\u221E' : String(S.depth);
     el.time.value = S.time; el.timeVal.textContent = fmtSecs(S.time);
+    el.mate.value = S.mateMode; el.mistakes.checked = S.mistakes;
+    syncDispatch();
     el.hash.value = String(S.hash);
     el.opacity.value = S.opacity; el.opacityVal.textContent = S.opacity + '%';
     el.panel.style.opacity = String(S.opacity / 100);
@@ -424,9 +445,12 @@
       return;
     }
     if (!engine.ready) { setStatus('Engine loading...'); return; }
-    setStatus(S.autoplay ? 'Finding the fastest forced mate / best move...' : 'Thinking...');
     const lim = limits(), t0 = Date.now();
-    // Auto-play gets multiple PVs so it can explicitly choose the shortest engine-verified mating line.
+    const strength = S.autoplay ? 'auto-play ' + autoplayLevelLabel() + ' ELO' : levelLabel() + ' ELO';
+    const goal = S.mateMode === 'shortest' ? ', preferring the shortest proven mate' : ', regular best move';
+    setStatus((S.time > 0 ? 'Thinking for ' + fmtSecs(S.time) + ' (' + strength + goal + ')...' : 'Searching (' + strength + goal + ')...'));
+    // Auto-play gets multiple PVs so it can choose the shortest engine-verified mating line, and so a natural
+    // mistake has real candidate moves to pick from instead of a single engine line.
     const r = await engine.analyze(pos.fen, lim, S.autoplay ? 5 : S.showTop3 ? 3 : 1);
     if (!r) return;                                           // superseded by a newer request
     if (seq !== analysisSeq) return;
@@ -439,15 +463,20 @@
     el.eval.textContent = L.evalText(top, pos.turn);
     setBar(top, pos.turn);
     el.elotxt.textContent = '-';
-    let msg = 'Done: depth ' + top.depth + (lim.depth ? '/' + lim.depth : '') + ' \u00B7 ' +
+    const spentMs = Date.now() - t0;
+    let msg = 'Thought ' + (spentMs / 1000).toFixed(2) + 's · played from depth ' + top.depth +
+      (lim.playDepth ? '/' + lim.playDepth : '') +
+      (r.searchDepth > top.depth ? ' (searched to ' + r.searchDepth + ')' : '') + ' \u00B7 ' +
       L.fmtCount(r.stats.nodes) + ' nodes' +
-      (r.stats.nps ? ' \u00B7 ' + Math.round(r.stats.nps / 1000) + ' kn/s' : '') + ' \u00B7 ' + ((Date.now() - t0) / 1000).toFixed(2) + 's';
-    const forcedMate = S.autoplay ? L.fastestMateLine(r.lines) : null;
-    if (forcedMate) msg += ' · fastest verified mate M' + forcedMate.score;
+      (r.stats.nps ? ' \u00B7 ' + Math.round(r.stats.nps / 1000) + ' kn/s' : '');
+    const forcedMate = L.fastestMateLine(r.lines);
+    if (forcedMate && S.mateMode === 'shortest') msg += ' · shortest verified mate M' + forcedMate.score;
     if (r.eager) {
-      msg += ' (first complete result - raise Max time for a deeper mate search)';
-    } else if (lim.depth && top.depth < lim.depth && top.type !== 'mate') {
-      msg += ' (time cap hit before target depth - raise Max time)';
+      msg += ' (first complete result - raise Think time for a deeper search)';
+    } else {
+      if (lim.playDepth && top.depth < lim.playDepth) msg += ' (target depth not reached in ' + fmtSecs(S.time) + ' - raise Think time)';
+      // a `go movetime` window only ends early when the engine has nothing left to search (a single legal move)
+      if (lim.timeMs > 0 && spentMs < lim.timeMs * 0.9) msg += ' (nothing left to think about here)';
     }
     setStatus(msg);
     render();
@@ -464,43 +493,42 @@
   const ourTurn = pos => pos.mover === sideForPosition(pos);
   const labelForPlay = () => autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
 
-  // If the engine has proven any winning mate among the candidate lines, choose the shortest one rather than
-  // relying on ordering alone. Otherwise, play the top engine line at the configured Auto-play ELO search depth.
-  // The ELO setting limits search strength; auto-play deliberately does not inject a random inaccuracy that
-  // could throw away a mate.
+  // Mate mode picks the line: 'shortest' takes the fewest-move mate the engine proved, 'normal' just plays the
+  // top line at the Auto-play ELO. Natural mistakes then get the low-ELO deviation roll - skipped while a proven
+  // mate is on the board, so a forced win is never thrown away to look human. The policy lives in lib.js.
   function pickForAutoplay(lines) {
-    const mate = L.fastestMateLine(lines);
-    if (mate && mate.move) return { uci: mate.move, mate };
-    const top = (lines || []).find(line => line && line.move);
-    return top ? { uci: top.move, mate: null } : null;
+    return L.chooseMove(lines, { elo: autoplayEloKey(), mistakes: S.mistakes, mateMode: S.mateMode, rand: Math.random });
   }
 
-  let playAttempt = null;         // { key, uci, ok, tries, at }: what auto-play tried for which position
+  let playAttempt = null;         // { key, uci, ok, tries, at, mate, mistake }: what auto-play tried for which position
   let playing = false;
 
   // Play one move for the analyzed position. Nothing here trusts the analysis: the board is re-read, and the
   // move goes through chess.com's own legal-move list (page-bridge), so a stale position simply does nothing.
-  // There is intentionally no timer or pace wait in this path.
+  // There is intentionally no extra pace timer: Think time was already spent searching for this move.
   async function autoPlay(pos, lines) {
     if (!S.autoplay || playing || !engine || !engine.ready || !lines || lines.length < 1 || !ourTurn(pos)) return;
     const key = keyOf(pos);
     if (playAttempt && playAttempt.key === key && playAttempt.ok) return;      // already moved for this position
     const choice = pickForAutoplay(lines);
     if (!choice) return;
-    // Yield only to the board/FEN request needed for stale-move protection; do not add a pacing delay.
+    // Yield only to the board/FEN request needed for stale-move protection; the move itself goes straight out.
     const now = await readPosition();
     if (!S.autoplay || !now || now.settling || keyOf(now) !== key || !ourTurn(now)) return;
-    await tryPlay(now, choice.uci, choice.mate);
+    await tryPlay(now, choice.uci, choice);
   }
 
   // One attempt on chess.com's board. Whether it worked is judged by the board itself: an accepted move changes
   // the position, and the poll loop retries the same move until it does (or gives up after a few tries).
-  async function tryPlay(pos, uci, mate) {
+  async function tryPlay(pos, uci, info) {
     const key = keyOf(pos);
     const prior = playAttempt && playAttempt.key === key ? playAttempt.tries : 0;
-    playAttempt = { key, uci, ok: false, tries: prior + 1, at: Date.now() };
+    playAttempt = { key, uci, ok: false, tries: prior + 1, at: Date.now(),
+      mate: info && info.mate ? info.mate : null, mistake: !!(info && info.mistake) };
+    const { mate, mistake } = playAttempt;
     const san = L.uciToSan(uci, pos.fen);
     const mateNote = mate ? ' · shortest verified mate M' + mate.score : '';
+    const slipNote = mistake ? ' · natural ' + autoplayLevelLabel() + ' ELO slip' : '';
     playing = true;
     let res;
     try { res = await playMove(uci); } finally { playing = false; }
@@ -508,10 +536,11 @@
       // an API move is confirmed by the board; a synthetic click is only reported once the board confirms it
       playAttempt.ok = !!res.confirmed;
       lastEloMove = uci; render();
-      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote;
+      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote + slipNote;
+      const when = S.time > 0 ? ' after ' + fmtSecs(S.time) + ' of thinking' : ' instantly';
       setStatus(res.confirmed
-        ? 'Auto-played ' + (res.san || san) + ' immediately' + mateNote
-        : 'Auto-play: sent ' + san + ' immediately - waiting for the board to confirm it' + mateNote);
+        ? 'Auto-played ' + (res.san || san) + when + mateNote + slipNote
+        : 'Auto-play: sent ' + san + when + ' - waiting for the board to confirm it' + mateNote + slipNote);
     } else {
       setStatus('Auto-play: ' + san + ' not played (' + res.reason + ')');
     }
@@ -555,15 +584,23 @@
       if (!lastResult || lastResult.fen !== base.fen) return;
       if (r && r.lines.length) lines = r.lines;
     }
-    const moves = lines.map(l => l.move), best = moves[0];
     const eloForPick = S.custom ? 1200 : eloKey();
-    const pick = getEloMove(best, moves, eloForPick);
-    lastEloMove = pick;
-    const san = L.uciToSan(pick, base.fen), label = S.custom ? '1200' : levelLabel();
-    if (pick !== best) {
+    const pick = L.chooseMove(lines, { elo: eloForPick, mistakes: S.mistakes, mateMode: S.mateMode, rand: Math.random });
+    if (!pick) return;
+    const best = lines.map(l => l.move)[0];
+    lastEloMove = pick.uci;
+    const san = L.uciToSan(pick.uci, base.fen), label = S.custom ? '1200' : levelLabel();
+    if (pick.mate) {
+      el.elotxt.textContent = san + ' (mate in ' + pick.mate.score + ' - the shortest line the engine proved)';
+      el.tip.textContent = 'Mate mode "fewest moves": any proven mate is played instead of a quieter top line. ' +
+        'Switch Checkmate style to Regular to let it just follow the evaluation.';
+    } else if (pick.uci !== best) {
       el.elotxt.textContent = san + ' (a likely inaccuracy at ' + label + ' ELO)';
       el.tip.textContent = 'At ' + label + ' ELO, players often pick a reasonable-looking move over the best one. ' + TIPS[eloForPick];
-    } else { el.elotxt.textContent = san + ' (same as the engine move)'; updateTip(); }
+    } else {
+      el.elotxt.textContent = san + ' (same as the engine move' + (S.mistakes ? '' : ' - mistakes are turned off') + ')';
+      updateTip();
+    }
     render();
   }
 
@@ -617,7 +654,7 @@
       // auto-play tried a move and the board still shows the same position: try again while it stays legal
       if (S.autoplay && !playing && playAttempt && !playAttempt.ok && playAttempt.key === key &&
         playAttempt.tries < 3 && Date.now() - playAttempt.at > 900 && ourTurn(pos)) {
-        tryPlay(pos, playAttempt.uci);
+        tryPlay(pos, playAttempt.uci, playAttempt);      // retry the same move, with the same mate/slip note
         return;
       }
       if (lastFlip !== pos.flipped) { lastFlip = pos.flipped; render(); }
@@ -731,6 +768,7 @@
       level: q('ct-level'), side: q('ct-side'), bestCb: q('ct-best'), top3: q('ct-top3'), auto: q('ct-auto'),
       autoplay: q('ct-autoplay'), autoplayElo: q('ct-autoplay-elo'), autohint: q('ct-autohint'),
       depth: q('ct-depth'), depthVal: q('ct-depthval'), depthRow: q('ct-depthrow'), time: q('ct-time'), timeVal: q('ct-timeval'),
+      mate: q('ct-mate'), mistakes: q('ct-mistakes'), response: q('ct-response'),
       hash: q('ct-hash'), opacity: q('ct-opacity'), opacityVal: q('ct-opacityval'),
       analyze: q('ct-analyze'), eloBtn: q('ct-elomove'), status: q('ct-status'), best: q('ct-bestmove'), eval: q('ct-eval'),
       engine: q('ct-engine'), verify: q('ct-verify'), engdetail: q('ct-engdetail'), barfill: q('ct-barfill'),
@@ -763,8 +801,17 @@
     });
     el.depth.addEventListener('input', () => { S.depth = +el.depth.value; el.depthVal.textContent = S.depth >= DEPTH_INF ? '\u221E' : String(S.depth); updateTip(); });
     el.depth.addEventListener('change', () => { saveSettings(); rerunSoon(); });
-    el.time.addEventListener('input', () => { S.time = +el.time.value; el.timeVal.textContent = fmtSecs(S.time); updateTip(); updateAutoHint(); });
-    el.time.addEventListener('change', () => { saveSettings(); rerunSoon(); });
+    el.time.addEventListener('input', () => { S.time = +el.time.value; el.timeVal.textContent = fmtSecs(S.time); updateTip(); updateAutoHint(); syncDispatch(); });
+    el.time.addEventListener('change', () => { saveSettings(); syncDispatch(); rerunSoon(); });
+    el.mate.addEventListener('change', () => {
+      S.mateMode = el.mate.value === 'normal' ? 'normal' : 'shortest';
+      saveSettings(); updateTip(); updateAutoHint(); rerun();
+    });
+    el.mistakes.addEventListener('change', () => {
+      S.mistakes = el.mistakes.checked;
+      saveSettings(); updateTip(); updateAutoHint();
+      if (lastResult) rerunSoon();          // the pick changes: its arrow should not keep pointing at the old slip
+    });
     el.autoplay.addEventListener('change', () => {
       S.autoplay = el.autoplay.checked; saveSettings(); updateAutoHint();
       if (playAttempt && !playAttempt.ok) playAttempt = null;
