@@ -1,0 +1,121 @@
+:root {
+  --ct-bg: #262522; --ct-bg2: #1f1e1c; --ct-bg3: #3c3b39; --ct-text: #e8e6e3; --ct-dim: #989795; --ct-faint: #6d6c6a;
+  --ct-green: #81b64c; --ct-amber: #e5a93d; --ct-red: #d1604b; --ct-blue: #5aa9e6;
+}
+#ct-root, #ct-root * { box-sizing: border-box; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+#ct-toggle {
+  position: fixed; left: 0.6rem; bottom: 0.6rem; z-index: 2147483646;
+  background: var(--ct-bg); color: #c3c2c1; border: none; border-radius: 0.4rem;
+  padding: 0.5rem 0.8rem; font-size: 0.8rem; font-weight: 600; cursor: pointer; min-height: 2.4rem; opacity: 0.85;
+  box-shadow: 0 0.2rem 0.8rem rgba(0,0,0,0.45);
+}
+#ct-toggle:hover { opacity: 1; }
+#ct-panel {
+  position: fixed; right: 0.6rem; bottom: 4rem; z-index: 2147483647;
+  width: min(17rem, 90vw); max-height: 78vh; display: none;
+  background: var(--ct-bg); color: var(--ct-text); border-radius: 0.5rem; font-size: 0.85rem;
+  box-shadow: 0 0.4rem 1.6rem rgba(0,0,0,0.55); overflow: hidden;
+  transition: transform 0.18s ease, opacity 0.15s ease, border-radius 0.18s;
+}
+#ct-panel.open { display: flex; flex-direction: column; }
+/* No tuck button and no docking: the panel is dragged freely and the walls do not stop it. Push it past an
+   edge and it simply keeps going until only a slim grab strip is left on screen; push it back and it is whole
+   again. .reveal slides a wall-hidden panel back into view on hover / focus / tap - only the surplus hanging
+   past a wall moves, so a panel that was pushed back on screen is never covered by the reveal. */
+#ct-panel.dragging { transition: none; }
+#ct-panel.reveal, #ct-panel.reveal.from-t, #ct-panel.reveal.from-b {
+  transform: translateX(clamp(-3.5rem, 100%, 3.5rem)) translateY(clamp(-3.5rem, 100%, 3.5rem));
+}
+#ct-panel.reveal.from-t { transform: translateX(clamp(-3.5rem, 100%, 3.5rem)) translateY(100%); }
+#ct-panel.reveal.from-b { transform: translateX(clamp(-3.5rem, 100%, 3.5rem)) translateY(-100%); }
+/* grab strip: parked on a wall while the panel pokes past it, so a half-hidden panel can always be pulled out.
+   It sits just under the "Chess Tutor" button (2147483646) so the launcher stays clickable in that corner. */
+.ct-strip { position: fixed; z-index: 2147483645; display: none; touch-action: none; }
+/* a slim accent mark on the wall side, so a panel hidden in the wall is easy to spot and pull back */
+.ct-strip::after { content: ""; position: absolute; border-radius: 1rem; background: var(--ct-green); opacity: 0.55; }
+.ct-strip:hover::after, .ct-strip:active::after { opacity: 1; }
+.ct-strip-l::after { left: 0.15rem; top: 50%; width: 0.2rem; height: 3.5rem; transform: translateY(-50%); }
+.ct-strip-r::after { right: 0.15rem; top: 50%; width: 0.2rem; height: 3.5rem; transform: translateY(-50%); }
+.ct-strip-t::after { top: 0.15rem; left: 50%; height: 0.2rem; width: 3.5rem; transform: translateX(-50%); }
+.ct-strip-b::after { bottom: 0.15rem; left: 50%; height: 0.2rem; width: 3.5rem; transform: translateX(-50%); }
+#ct-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 0.4rem 0.7rem; background: var(--ct-bg2); cursor: move; min-height: 1.7rem;
+  touch-action: none; user-select: none; -webkit-user-select: none;
+}
+#ct-title { font-size: 0.85rem; font-weight: 700; color: var(--ct-text); }
+#ct-headbtns { display: flex; gap: 0.2rem; }
+#ct-headbtns button { background: none; border: none; color: var(--ct-dim); font-size: 0.78rem; padding: 0.35rem 0.4rem; min-height: 1.9rem; cursor: pointer; }
+#ct-headbtns button:hover { color: var(--ct-text); }
+#ct-body { padding: 0.7rem 0.8rem 0.8rem; overflow-y: auto; }
+
+.ct-label { font-size: 0.72rem; color: var(--ct-dim); white-space: nowrap; }
+#ct-engine-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem; gap: 0.5rem; }
+#ct-engine { font-size: 0.78rem; color: var(--ct-text); font-weight: 600; text-align: right; word-break: break-word; }
+#ct-verify { font-size: 0.74rem; font-weight: 700; margin-bottom: 0.2rem; }
+#ct-verify.ok { color: var(--ct-green); }
+#ct-verify.warn { color: var(--ct-amber); }
+#ct-engdetail { font-size: 0.66rem; color: var(--ct-faint); line-height: 1.35; margin-bottom: 0.6rem; word-break: break-word; }
+
+#ct-main { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+#ct-bestmove { font-size: 1.7rem; font-weight: 700; color: #fff; line-height: 1.1; }
+#ct-eval { font-size: 0.9rem; font-weight: 700; padding: 0.25rem 0.55rem; border-radius: 0.3rem; background: var(--ct-bg3); color: var(--ct-text); }
+#ct-eval.pos { background: #f1f1f0; color: #262522; }
+#ct-eval.neg { background: #111; color: #f1f1f0; }
+#ct-bar { height: 0.35rem; background: #111; border-radius: 0.2rem; overflow: hidden; margin-bottom: 0.9rem; }
+#ct-barfill { height: 100%; width: 50%; background: #f1f1f0; transition: width 0.3s; }
+
+.ct-field { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; gap: 0.6rem; }
+#ct-panel select {
+  background: var(--ct-bg3); color: var(--ct-text); border: none; border-radius: 0.35rem;
+  padding: 0.5rem 0.6rem; font-size: 0.85rem; min-height: 2.5rem; width: 58%;
+}
+#ct-panel select option { color: #111; }
+.ct-range input[type=range] { flex: 1; min-width: 0; accent-color: var(--ct-green); height: 1.6rem; }
+.ct-val { font-size: 0.75rem; color: var(--ct-text); min-width: 2.4rem; text-align: right; font-variant-numeric: tabular-nums; }
+
+.ct-switch { display: flex; justify-content: space-between; align-items: center; min-height: 2.4rem; font-size: 0.88rem; cursor: pointer; }
+.ct-switch input {
+  appearance: none; -webkit-appearance: none; position: relative; flex: none;
+  width: 2.6rem; height: 1.5rem; border-radius: 1rem; background: var(--ct-bg3); transition: background 0.15s; cursor: pointer; margin: 0;
+}
+.ct-switch input::after {
+  content: ""; position: absolute; top: 0.2rem; left: 0.2rem; width: 1.1rem; height: 1.1rem;
+  border-radius: 50%; background: #c3c2c1; transition: transform 0.15s;
+}
+.ct-switch input:checked { background: var(--ct-green); }
+.ct-switch input:checked::after { transform: translateX(1.1rem); background: #fff; }
+
+/* auto-play: the hint doubles as the state readout - dim while it is off, amber while the tutor is moving for you */
+#ct-speedrow { margin-top: -0.15rem; }
+#ct-speedrow.off { opacity: 0.5; }
+#ct-autohint { margin: -0.1rem 0 0.55rem; font-size: 0.7rem; line-height: 1.35; color: var(--ct-faint); }
+#ct-autohint.on { color: var(--ct-amber); font-weight: 600; }
+
+#ct-analyze, #ct-elomove {
+  display: block; width: 100%; border: none; border-radius: 0.35rem; min-height: 2.7rem;
+  font-size: 0.88rem; font-weight: 700; cursor: pointer; margin-top: 0.5rem;
+}
+#ct-analyze { background: var(--ct-green); color: #1b2a0c; }
+#ct-elomove { background: var(--ct-bg3); color: var(--ct-text); }
+
+#ct-elobox { margin-top: 0.8rem; font-size: 0.85rem; }
+#ct-elotxt { color: #fff; font-weight: 600; }
+#ct-tip { margin-top: 0.4rem; font-size: 0.75rem; line-height: 1.4; color: var(--ct-dim); }
+#ct-status { margin-top: 0.6rem; font-size: 0.72rem; color: var(--ct-faint); word-break: break-word; }
+#ct-draghint { margin-top: 0.55rem; padding-top: 0.5rem; border-top: 1px solid var(--ct-bg3); font-size: 0.68rem; line-height: 1.4; color: var(--ct-faint); }
+#ct-fenbox { margin-top: 0.4rem; font-size: 0.7rem; color: var(--ct-faint); }
+#ct-fenbox summary { cursor: pointer; }
+#ct-fen { font-family: ui-monospace, Menlo, monospace; font-size: 0.65rem; word-break: break-all; }
+
+/* ---- board overlay: same palette as the panel, chess.com-style translucent arrows ---- */
+.ct-overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 20; }
+.ct-overlay .ct-sq0, .ct-overlay .ct-sq0b { fill: var(--ct-green); }
+.ct-overlay .ct-sq3, .ct-overlay .ct-sq3b { fill: var(--ct-blue); }
+.ct-overlay .ct-shaft { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.ct-overlay .ct-a0 .ct-shaft { stroke: var(--ct-green); } .ct-overlay .ct-a0 .ct-head, .ct-overlay .ct-a0 .ct-badge { fill: var(--ct-green); }
+.ct-overlay .ct-a1 .ct-shaft { stroke: var(--ct-amber); } .ct-overlay .ct-a1 .ct-head, .ct-overlay .ct-a1 .ct-badge { fill: var(--ct-amber); }
+.ct-overlay .ct-a2 .ct-shaft { stroke: var(--ct-red); }   .ct-overlay .ct-a2 .ct-head, .ct-overlay .ct-a2 .ct-badge { fill: var(--ct-red); }
+.ct-overlay .ct-a3 .ct-shaft { stroke: var(--ct-blue); }  .ct-overlay .ct-a3 .ct-head, .ct-overlay .ct-a3 .ct-badge { fill: var(--ct-blue); }
+.ct-overlay .ct-badge-ring { fill: none; stroke: #262522; stroke-width: 0.5; }
+.ct-overlay .ct-badge-txt { fill: #1b2a0c; font: 700 2.9px system-ui, -apple-system, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: central; }

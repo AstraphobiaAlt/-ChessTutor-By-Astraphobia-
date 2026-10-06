@@ -1,0 +1,83 @@
+<button id="ct-toggle" type="button">Chess Tutor</button>
+<div id="ct-panel" role="dialog" aria-label="Chess Tutor">
+  <div id="ct-head" title="Drag me anywhere - the panel slides straight through the screen edges and back">
+    <span id="ct-title">Chess Tutor</span>
+    <span id="ct-headbtns">
+      <button id="ct-close" type="button" aria-label="Close">Hide</button>
+    </span>
+  </div>
+  <div id="ct-body">
+    <div id="ct-engine-row"><span class="ct-label">Engine</span><span id="ct-engine">Loading...</span></div>
+    <div id="ct-verify" class="warn">Checking engine...</div>
+    <div id="ct-engdetail"></div>
+
+    <div id="ct-main">
+      <span id="ct-bestmove">-</span>
+      <span id="ct-eval">0.0</span>
+    </div>
+    <div id="ct-bar"><div id="ct-barfill"></div></div>
+
+    <div class="ct-field">
+      <span class="ct-label">Play level</span>
+      <select id="ct-level" aria-label="Play level">
+        <option value="400">400 ELO</option><option value="600">600 ELO</option>
+        <option value="800">800 ELO</option><option value="1000">1000 ELO</option>
+        <option value="1200">1200 ELO</option><option value="1500">1500 ELO</option>
+        <option value="1800">1800 ELO</option><option value="2000">2000+ ELO</option>
+        <option value="2500">2500 ELO</option><option value="3200">Full engine (max)</option>
+        <option value="custom">Custom depth / time</option>
+      </select>
+    </div>
+    <div class="ct-field ct-range" id="ct-depthrow">
+      <span class="ct-label">Depth</span>
+      <input type="range" id="ct-depth" min="1" max="40" step="1" aria-label="Search depth">
+      <span id="ct-depthval" class="ct-val">24</span>
+    </div>
+    <div class="ct-field ct-range">
+      <span class="ct-label">Max time</span>
+      <input type="range" id="ct-time" min="0" max="60" step="0.1" aria-label="Maximum thinking time in seconds, 0 means instant">
+      <span id="ct-timeval" class="ct-val">8s</span>
+    </div>
+    <div class="ct-field">
+      <span class="ct-label">Memory (hash)</span>
+      <select id="ct-hash" aria-label="Hash memory">
+        <option value="16">16 MB</option><option value="32">32 MB</option><option value="64">64 MB</option>
+        <option value="128">128 MB</option><option value="256">256 MB</option>
+      </select>
+    </div>
+    <div class="ct-field">
+      <span class="ct-label">Show moves for</span>
+      <select id="ct-side" aria-label="Show moves for">
+        <option value="me">My side (bottom)</option>
+        <option value="turn">Side to move</option>
+        <option value="w">White</option>
+        <option value="b">Black</option>
+      </select>
+    </div>
+
+    <label class="ct-switch"><span>Best move</span><input type="checkbox" id="ct-best"></label>
+    <label class="ct-switch"><span>Top 3 moves</span><input type="checkbox" id="ct-top3"></label>
+    <label class="ct-switch"><span>Auto-analyze</span><input type="checkbox" id="ct-auto"></label>
+    <label class="ct-switch"><span>Auto-play</span><input type="checkbox" id="ct-autoplay"></label>
+    <div class="ct-field ct-range" id="ct-speedrow">
+      <span class="ct-label">Play speed</span>
+      <input type="range" id="ct-speed" min="0" max="5" step="0.1" aria-label="Auto-play speed in seconds, 0 means instant">
+      <span id="ct-speedval" class="ct-val">instant</span>
+    </div>
+    <div id="ct-autohint"></div>
+    <div class="ct-field ct-range">
+      <span class="ct-label">Panel opacity</span>
+      <input type="range" id="ct-opacity" min="35" max="100" step="5" aria-label="Panel opacity">
+      <span id="ct-opacityval" class="ct-val">100%</span>
+    </div>
+
+    <button id="ct-analyze" type="button">Analyze now</button>
+    <button id="ct-elomove" type="button">What would 1200 play?</button>
+
+    <div id="ct-elobox"><span class="ct-label">ELO move</span> <span id="ct-elotxt">-</span></div>
+    <div id="ct-tip"></div>
+    <div id="ct-draghint">Drag the title bar: the panel slides straight through any wall and comes back - no tuck button, works in every mode.</div>
+    <div id="ct-status">Idle</div>
+    <details id="ct-fenbox"><summary>Position (FEN)</summary><span id="ct-fen">-</span></details>
+  </div>
+</div>
