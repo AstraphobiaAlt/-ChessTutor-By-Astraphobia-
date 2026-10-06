@@ -24,14 +24,15 @@
     elo: 1200, custom: false, depth: 24, time: 8, hash: 128,
     showBest: true, showTop3: true, auto: true, side: 'me', open: true,
     pos: null, opacity: 100,
-    autoplay: false, speed: 0      // speed 0 = play as soon as the engine has a move
+    // Auto-play has its own strength setting. It never adds a play-speed delay: it sends the selected legal
+    // move immediately after the engine completes the configured search.
+    autoplay: false, autoplayElo: 3200
   };
   const S = Object.assign({}, DEFAULTS);
   const DEPTH_INF = 40;            // slider maximum means "no depth limit"
   const NS = 'http://www.w3.org/2000/svg';
-  const SPEED_MAX = 5;             // auto-play speed slider: 0 (instant) .. 5s per move
-  const EAGER_SAFETY_MS = 2500;    // "instant" still backs off after this, so a stuck engine cannot hang forever
-  const POLL_MS = 600, AUTOPLAY_TICK_MS = 200;   // how often the board is read; auto-play gets a faster tick
+  const EAGER_SAFETY_MS = 2500;    // prevents an unlimited, instant search from running forever
+  const POLL_MS = 600, AUTOPLAY_TICK_MS = 100;   // MutationObserver handles the immediate path; this is a fallback
 
   let lastResult = null;           // { fen, lines, turn }
   let lastEloMove = null;
@@ -40,6 +41,7 @@
   let el = {};
   let revealTimer = null, hideTimer = null, drag = null, panelHover = false, panelFocus = false;
   let analysisSeq = 0, polling = false, mismatch = 0, pollTimer = null;
+  let boardObserver = null, observedBoard = null, autoPollQueued = false, autoPollScheduled = false;
 
   // ---------- ELO deviation (as specified; the rule itself lives in lib.js so the tests can drive it) ----------
   const getEloMove = (bestMove, candidateMoves, elo) => L.eloMove(bestMove, candidateMoves, elo, Math.random);
@@ -49,13 +51,16 @@
   const clamp = (v, a, b, d) => (typeof v === 'number' && isFinite(v)) ? Math.max(a, Math.min(b, v)) : d;
   function sanitize() {
     S.elo = PRESETS[S.elo] !== undefined ? S.elo : 1200;
+    S.autoplayElo = PRESETS[S.autoplayElo] !== undefined ? S.autoplayElo : 3200;
     S.depth = Math.round(clamp(S.depth, 1, DEPTH_INF, 24));
-    S.time = clamp(S.time, 0, 60, 8);          // 0 = instant: take the engine's first result instead of waiting
-    S.speed = clamp(S.speed, 0, SPEED_MAX, 0); // 0 = auto-play moves the moment the engine has one
+    S.time = clamp(S.time, 0, 60, 8);          // 0 = first complete engine result; any value above it is a search cap
     S.hash = [16, 32, 64, 128, 256].includes(S.hash) ? S.hash : 128;
     S.opacity = clamp(S.opacity, 35, 100, 100);
     S.autoplay = !!S.autoplay;
     if (!['me', 'turn', 'w', 'b'].includes(S.side)) S.side = 'me';
+    // "speed" belonged to the old paced auto-play UI. Delete it on load so every upgraded installation now has
+    // the same no-added-delay behavior, rather than silently retaining a stored wait.
+    delete S.speed;
     delete S.dock; delete S.tucked; delete S.autoTuck;   // 1.1 tuck state: replaced by free dragging
   }
   function loadSettings() {
@@ -127,7 +132,8 @@
 
   async function readPosition() {
     const b = getBoard();
-    if (!b) return null;
+    if (!b) { watchBoard(null); return null; }
+    if (S.autoplay) watchBoard(b);
     const pieces = readPieces(b);
     if (!Object.keys(pieces).length) return null;
     const flipped = isFlipped(b), me = flipped ? 'b' : 'w';
@@ -140,20 +146,25 @@
     }
     if (!fen) fen = L.buildFen(pieces, domMover(b, pieces));
     const mover = fen.split(' ')[1] === 'b' ? 'b' : 'w';
-    const turn = (S.side === 'w' || S.side === 'b') ? S.side : (S.side === 'turn' ? mover : me);
-    return { board: b, turn, mover, me, flipped, src, fen: L.setTurn(fen, turn) };
+    // Never rewrite the FEN turn. Analysing an invented side to move can produce a move that chess.com's board
+    // must reject; the selected side controls when we act, while the actual board turn controls legality.
+    return { board: b, turn: mover, mover, me, flipped, src, fen };
   }
   const keyOf = p => p.fen.split(' ').slice(0, 4).join(' ') + '|' + p.mover + S.side;
 
   // ---------- Search limits ----------
   const eloKey = () => PRESETS[S.elo] !== undefined ? S.elo : 1200;
-  // "Max time 0" means instant everywhere, and auto-play speed 0 means the same thing (see lib.searchLimits):
-  // the engine's first complete result is the answer and the search is stopped right after it.
+  const autoplayEloKey = () => PRESETS[S.autoplayElo] !== undefined ? S.autoplayElo : 3200;
+  // Auto-play moves immediately once a legal move is ready. That is intentionally separate from search time:
+  // the Auto-play ELO depth and Max time still give Stockfish enough information to recognize a forced mate.
   function limits() {
-    const depth = S.custom ? (S.depth >= DEPTH_INF ? 0 : S.depth) : PRESETS[eloKey()];
-    return L.searchLimits({ depth, time: S.time, autoplay: S.autoplay, speed: S.speed, safetyMs: EAGER_SAFETY_MS });
+    const depth = S.autoplay
+      ? PRESETS[autoplayEloKey()]
+      : (S.custom ? (S.depth >= DEPTH_INF ? 0 : S.depth) : PRESETS[eloKey()]);
+    return L.searchLimits({ depth, time: S.time, safetyMs: EAGER_SAFETY_MS });
   }
   const levelLabel = () => S.custom ? 'Custom' : S.elo >= 3200 ? 'Max' : S.elo >= 2000 ? S.elo + '+' : String(S.elo);
+  const autoplayLevelLabel = () => autoplayEloKey() >= 3200 ? 'Full engine' : autoplayEloKey() >= 2000 ? autoplayEloKey() + '+' : String(autoplayEloKey());
 
   // ---------- Engine ----------
   class Engine {
@@ -370,14 +381,13 @@
   }
   function updateAutoHint() {
     const who = S.side === 'me' ? 'your side' : S.side === 'turn' ? 'the side to move, both colours' : S.side === 'w' ? 'White' : 'Black';
-    const at = S.custom ? 'custom depth/time' : levelLabel() + ' ELO';
-    let t;
-    if (!S.autoplay) t = 'Off - turn on and the tutor plays ' + who + ' by itself at ' + at + '.';
-    else if (S.speed <= 0) t = 'On: ' + who + ' at ' + at + ', ' + (S.time <= 0 ? 'instant' : 'as soon as the engine has a move') + '.';
-    else t = 'On: ' + who + ' at ' + at + ', about one move every ' + fmtSecs(S.speed) + '.';
-    el.autohint.textContent = t;
+    const at = autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
+    const mateGoal = 'Shortest engine-verified forced mate takes priority.';
+    const timing = 'Moves are dispatched immediately after the engine returns a legal move.';
+    el.autohint.textContent = S.autoplay
+      ? 'On: ' + who + ' at ' + at + '. ' + timing + ' ' + mateGoal
+      : 'Off - turn on to play ' + who + ' at ' + at + '. ' + mateGoal;
     el.autohint.classList.toggle('on', S.autoplay);
-    el.speedRow.classList.toggle('off', !S.autoplay);
   }
   function syncControls() {
     el.level.value = S.custom ? 'custom' : String(eloKey());
@@ -387,7 +397,7 @@
     el.hash.value = String(S.hash);
     el.opacity.value = S.opacity; el.opacityVal.textContent = S.opacity + '%';
     el.panel.style.opacity = String(S.opacity / 100);
-    el.speed.value = S.speed; el.speedVal.textContent = fmtSecs(S.speed);
+    el.autoplayElo.value = String(autoplayEloKey());
     el.autoplay.checked = S.autoplay;
     updateTip(); updateAutoHint();
   }
@@ -408,11 +418,15 @@
     el.fen.textContent = pos.fen;
     lastKeySeen = keyOf(pos);
     lastEloMove = null; lastResult = null; render();          // hide arrows until the answer is final
-    if (S.side === 'me' && pos.mover !== pos.me) { el.best.textContent = '-'; setStatus('Opponent to move - waiting'); return; }
+    if (!ourTurn(pos)) {
+      el.best.textContent = '-';
+      setStatus(sideLabel(sideForPosition(pos)) + ' to move - waiting');
+      return;
+    }
     if (!engine.ready) { setStatus('Engine loading...'); return; }
-    setStatus('Thinking...');
+    setStatus(S.autoplay ? 'Finding the fastest forced mate / best move...' : 'Thinking...');
     const lim = limits(), t0 = Date.now();
-    // auto-play wants a wider candidate list, so the ELO pick has something to choose from
+    // Auto-play gets multiple PVs so it can explicitly choose the shortest engine-verified mating line.
     const r = await engine.analyze(pos.fen, lim, S.autoplay ? 5 : S.showTop3 ? 3 : 1);
     if (!r) return;                                           // superseded by a newer request
     if (seq !== analysisSeq) return;
@@ -428,56 +442,65 @@
     let msg = 'Done: depth ' + top.depth + (lim.depth ? '/' + lim.depth : '') + ' \u00B7 ' +
       L.fmtCount(r.stats.nodes) + ' nodes' +
       (r.stats.nps ? ' \u00B7 ' + Math.round(r.stats.nps / 1000) + ' kn/s' : '') + ' \u00B7 ' + ((Date.now() - t0) / 1000).toFixed(2) + 's';
+    const forcedMate = S.autoplay ? L.fastestMateLine(r.lines) : null;
+    if (forcedMate) msg += ' · fastest verified mate M' + forcedMate.score;
     if (r.eager) {
-      msg += S.autoplay && S.speed <= 0
-        ? ' (instant - raise Play speed for a deeper search)'
-        : ' (instant - raise Max time for a deeper answer)';
+      msg += ' (first complete result - raise Max time for a deeper mate search)';
     } else if (lim.depth && top.depth < lim.depth && top.type !== 'mate') {
-      msg += S.autoplay && S.speed > 0
-        ? ' (play speed cap hit - raise Play speed for a deeper search)'
-        : ' (time cap hit before target depth - raise Max time)';
+      msg += ' (time cap hit before target depth - raise Max time)';
     }
     setStatus(msg);
     render();
-    if (S.autoplay) autoPlay(pos, r.lines, t0).catch(() => {});
+    if (S.autoplay) autoPlay(pos, r.lines).catch(() => {});
   }
 
   // ---------- Auto-play ----------
-  // The move the tutor would show for the selected level: the ELO-deviation pick when a level is chosen
-  // (same rule as the "What would X play?" button), the engine's best move in custom depth/time mode.
-  function pickForLevel(lines) {
-    const moves = lines.map(l => l.move).filter(Boolean);
-    if (!moves.length) return null;
-    return S.custom ? moves[0] : getEloMove(moves[0], moves, eloKey());
+  // Keep the physical board turn and the configured side separate. A selected colour is only acted on when it
+  // is actually that colour's turn; this prevents a synthetic FEN from suggesting an illegal move.
+  function sideForPosition(pos) {
+    return S.side === 'me' ? pos.me : S.side === 'turn' ? pos.mover : S.side;
   }
-  const ourTurn = pos => !(S.side === 'me' && pos.mover !== pos.me);
-  const labelForPlay = () => S.custom ? 'your custom search' : levelLabel() + ' ELO';
+  function sideLabel(side) { return side === 'w' ? 'White' : 'Black'; }
+  const ourTurn = pos => pos.mover === sideForPosition(pos);
+  const labelForPlay = () => autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
+
+  // If the engine has proven any winning mate among the candidate lines, choose the shortest one rather than
+  // relying on ordering alone. Otherwise, play the top engine line at the configured Auto-play ELO search depth.
+  // The ELO setting limits search strength; auto-play deliberately does not inject a random inaccuracy that
+  // could throw away a mate.
+  function pickForAutoplay(lines) {
+    const mate = L.fastestMateLine(lines);
+    if (mate && mate.move) return { uci: mate.move, mate };
+    const top = (lines || []).find(line => line && line.move);
+    return top ? { uci: top.move, mate: null } : null;
+  }
+
   let playAttempt = null;         // { key, uci, ok, tries, at }: what auto-play tried for which position
   let playing = false;
 
   // Play one move for the analyzed position. Nothing here trusts the analysis: the board is re-read, and the
   // move goes through chess.com's own legal-move list (page-bridge), so a stale position simply does nothing.
-  async function autoPlay(pos, lines, t0) {
+  // There is intentionally no timer or pace wait in this path.
+  async function autoPlay(pos, lines) {
     if (!S.autoplay || playing || !engine || !engine.ready || !lines || lines.length < 1 || !ourTurn(pos)) return;
     const key = keyOf(pos);
     if (playAttempt && playAttempt.key === key && playAttempt.ok) return;      // already moved for this position
-    const uci = pickForLevel(lines);
-    if (!uci) return;
-    const wait = L.paceWait(Math.round(S.speed * 1000), Date.now() - t0);
-    if (wait) await new Promise(r => setTimeout(r, wait));
-    if (!S.autoplay) return;
+    const choice = pickForAutoplay(lines);
+    if (!choice) return;
+    // Yield only to the board/FEN request needed for stale-move protection; do not add a pacing delay.
     const now = await readPosition();
-    if (!now || now.settling || keyOf(now) !== key || !ourTurn(now)) return;   // the board moved on: poll handles it
-    await tryPlay(now, uci);
+    if (!S.autoplay || !now || now.settling || keyOf(now) !== key || !ourTurn(now)) return;
+    await tryPlay(now, choice.uci, choice.mate);
   }
 
   // One attempt on chess.com's board. Whether it worked is judged by the board itself: an accepted move changes
   // the position, and the poll loop retries the same move until it does (or gives up after a few tries).
-  async function tryPlay(pos, uci) {
+  async function tryPlay(pos, uci, mate) {
     const key = keyOf(pos);
     const prior = playAttempt && playAttempt.key === key ? playAttempt.tries : 0;
     playAttempt = { key, uci, ok: false, tries: prior + 1, at: Date.now() };
     const san = L.uciToSan(uci, pos.fen);
+    const mateNote = mate ? ' · shortest verified mate M' + mate.score : '';
     playing = true;
     let res;
     try { res = await playMove(uci); } finally { playing = false; }
@@ -485,10 +508,10 @@
       // an API move is confirmed by the board; a synthetic click is only reported once the board confirms it
       playAttempt.ok = !!res.confirmed;
       lastEloMove = uci; render();
-      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')';
+      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote;
       setStatus(res.confirmed
-        ? 'Auto-played ' + (res.san || san) + (S.speed > 0 ? '' : ' (instant)')
-        : 'Auto-play: sent ' + san + ' - waiting for the board to confirm it');
+        ? 'Auto-played ' + (res.san || san) + ' immediately' + mateNote
+        : 'Auto-play: sent ' + san + ' immediately - waiting for the board to confirm it' + mateNote);
     } else {
       setStatus('Auto-play: ' + san + ' not played (' + res.reason + ')');
     }
@@ -544,7 +567,39 @@
     render();
   }
 
-  // ---------- Auto-detect (polling: chess.com mutates the DOM constantly, so observers/debounce starve) ----------
+  // ---------- Auto-detect ----------
+  // The observer is the no-added-delay path for auto-play: when chess.com updates the board, queue one read in
+  // the next microtask instead of waiting for the fallback timer. The timer below remains only for board builds
+  // that update their game object before their DOM.
+  function queueAutoPoll() {
+    if (!S.autoplay) return;
+    // Coalesce a burst of board mutations. If a read is already in flight, retain the dirty flag so its finally
+    // block performs one fresh read instead of losing the opponent's move until the fallback timer fires.
+    autoPollQueued = true;
+    if (polling || autoPollScheduled) return;
+    autoPollScheduled = true;
+    const run = () => {
+      autoPollScheduled = false;
+      if (!S.autoplay) { autoPollQueued = false; return; }
+      if (!autoPollQueued || polling) return;
+      autoPollQueued = false;
+      poll();
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(run);
+    else Promise.resolve().then(run);
+  }
+  function watchBoard(board) {
+    if (!S.autoplay || !board || typeof MutationObserver !== 'function') {
+      if (boardObserver) boardObserver.disconnect();
+      boardObserver = null; observedBoard = null;
+      return;
+    }
+    if (observedBoard === board && boardObserver) return;
+    if (boardObserver) boardObserver.disconnect();
+    observedBoard = board;
+    boardObserver = new MutationObserver(queueAutoPoll);
+    boardObserver.observe(board, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style'] });
+  }
   async function poll() {
     if (polling) return;
     polling = true;
@@ -567,10 +622,13 @@
       }
       if (lastFlip !== pos.flipped) { lastFlip = pos.flipped; render(); }
       if (lastResult && !pos.board.querySelector(':scope > svg.ct-overlay')) render();
-    } finally { polling = false; }
+    } finally {
+      polling = false;
+      if (autoPollQueued) queueAutoPoll();
+    }
   }
-  // One poll at a time. Auto-play breathes faster (a move per tick is what makes it feel instant) while the
-  // idle tutor can afford to look at the board less often.
+  // One poll at a time. Auto-play normally arrives here through the MutationObserver; the shorter timer is only
+  // a safety net for board implementations whose state update is not reflected in the observed DOM immediately.
   async function pollLoop() {
     await poll();
     pollTimer = setTimeout(pollLoop, S.autoplay ? AUTOPLAY_TICK_MS : POLL_MS);
@@ -671,7 +729,7 @@
     el = {
       root: root, toggle: q('ct-toggle'), panel: q('ct-panel'), head: q('ct-head'), close: q('ct-close'),
       level: q('ct-level'), side: q('ct-side'), bestCb: q('ct-best'), top3: q('ct-top3'), auto: q('ct-auto'),
-      autoplay: q('ct-autoplay'), speed: q('ct-speed'), speedVal: q('ct-speedval'), speedRow: q('ct-speedrow'), autohint: q('ct-autohint'),
+      autoplay: q('ct-autoplay'), autoplayElo: q('ct-autoplay-elo'), autohint: q('ct-autohint'),
       depth: q('ct-depth'), depthVal: q('ct-depthval'), depthRow: q('ct-depthrow'), time: q('ct-time'), timeVal: q('ct-timeval'),
       hash: q('ct-hash'), opacity: q('ct-opacity'), opacityVal: q('ct-opacityval'),
       analyze: q('ct-analyze'), eloBtn: q('ct-elomove'), status: q('ct-status'), best: q('ct-bestmove'), eval: q('ct-eval'),
@@ -710,11 +768,20 @@
     el.autoplay.addEventListener('change', () => {
       S.autoplay = el.autoplay.checked; saveSettings(); updateAutoHint();
       if (playAttempt && !playAttempt.ok) playAttempt = null;
-      if (S.autoplay) analyze();                                   // start playing straight away
-      else setStatus('Auto-play off');
+      if (S.autoplay) {
+        watchBoard(getBoard());
+        queueAutoPoll();
+        analyze();                                                // start searching straight away
+      } else {
+        watchBoard(null);
+        setStatus('Auto-play off');
+      }
     });
-    el.speed.addEventListener('input', () => { S.speed = +el.speed.value; el.speedVal.textContent = fmtSecs(S.speed); updateAutoHint(); });
-    el.speed.addEventListener('change', saveSettings);
+    el.autoplayElo.addEventListener('change', () => {
+      S.autoplayElo = +el.autoplayElo.value;
+      saveSettings(); updateAutoHint();
+      if (S.autoplay) rerun();
+    });
     el.hash.addEventListener('change', () => { S.hash = +el.hash.value; saveSettings(); if (engine && engine.ready) { engine.setHash(S.hash); showEngine(); } });
     el.side.addEventListener('change', () => { S.side = el.side.value; saveSettings(); updateAutoHint(); rerun(); });
     el.bestCb.addEventListener('change', () => { S.showBest = el.bestCb.checked; saveSettings(); render(); });

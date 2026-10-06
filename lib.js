@@ -157,11 +157,26 @@
     return Object.keys(byDepth[prev]).length ? prev : null;
   }
 
+  /* A UCI `score mate +N` is a mate for the side to move, and lower positive values are sooner.  MultiPV
+     normally ranks this correctly already, but selecting it explicitly keeps auto-play's mate-first policy
+     stable even if candidate lines arrive in a different order. Returns the original line, or null when no
+     engine-verified winning mate is present. */
+  function fastestMateLine(lines) {
+    var best = null;
+    (lines || []).forEach(function (line) {
+      if (!line || !line.move || line.type !== 'mate' || !(line.score > 0)) return;
+      if (!best || line.score < best.score ||
+        (line.score === best.score && (line.depth || 0) > (best.depth || 0))) best = line;
+    });
+    return best;
+  }
+
   /* ---- what to ask the engine for ----
      opt = { depth, time, autoplay, speed, safetyMs }
-       time 0          -> instant: no time cap, the first complete result is the answer and the search is stopped
-       autoplay, speed 0 -> the same, because a move that is already known has no reason to wait for a deeper one
-       autoplay, speed > 0 -> the search is capped at that many seconds, so moves come out at the chosen rhythm
+       time 0 -> first-complete-result mode: stop after a usable answer rather than waiting on a clock.
+       `autoplay` / `speed` are retained for configurations saved by releases before 1.4, where speed also
+       constrained the search. The current auto-play path omits both: it dispatches immediately after a normal
+       ELO/time-bounded engine result so mating lines are not discarded just to create an artificial pace.
      A search is never sent with neither a depth nor a time (a bare "go" would run forever). */
   function searchLimits(opt) {
     opt = opt || {};
@@ -247,7 +262,7 @@
   var api = { fenBoardMap: fenBoardMap, uciToSan: uciToSan, placementOf: placementOf, buildFen: buildFen, setTurn: setTurn,
     parseOption: parseOption, parseInfo: parseInfo, evalText: evalText, whitePct: whitePct, sqCenter: sqCenter,
     arrowShape: arrowShape, fmtCount: fmtCount, panelGeom: panelGeom,
-    bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, searchLimits: searchLimits,
+    bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, fastestMateLine: fastestMateLine, searchLimits: searchLimits,
     goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES };
   root.CTLib = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
