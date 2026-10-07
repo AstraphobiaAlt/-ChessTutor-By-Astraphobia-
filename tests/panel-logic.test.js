@@ -4,9 +4,8 @@
      - the move is still read from the level's depth, so the think time does not turn 400 ELO into full engine
      - Think time 0 stays instant (`go depth N`, stopped as soon as a complete answer exists)
      - auto-play dispatches as soon as that search is back; there is no extra pacing timer
-     - Checkmate style decides between the fewest-move mate and the regular top line
-     - Natural mistakes decides whether a low level swaps its best line for another candidate, and never while a
-       proven mate is on the board
+     - Checkmate style decides between a mate proved anywhere in the search, an aggressive candidate, and the regular top line
+     - Natural mistakes controls only deliberate random deviations, and never replaces a proven mate
      - the new controls are in the panel and are persisted through chrome.storage
    Run with: node tests/panel-logic.test.js       (needs jsdom once: npm install --no-save jsdom)
    Without jsdom installed the file skips itself, so the offline unit tests still run. */
@@ -288,8 +287,8 @@ async function firstPlayedMove(t) {
   }
   {
     const r = await autoplayCase({ autoplayElo: 400, mateMode: 'normal', mistakes: true, __rand: 0.5 }, { depths: 4 });
-    eq(r.uci, MOVE_POOL[Math.floor(0.5 * MOVE_POOL.length)],
-      'Natural mistakes on: 400 ELO picks a candidate line instead of the best one, after the same 1s think time');
+    eq(r.uci, MOVE_POOL[1 + Math.floor(0.5 * (MOVE_POOL.length - 1))],
+      'Natural mistakes on: a triggered 400 ELO deviation picks a non-best candidate after the same 1s think time');
     ok(/natural 400 ELO slip/.test(r.status), 'the panel admits it was a slip: ' + r.status);
   }
   {
@@ -304,9 +303,27 @@ async function firstPlayedMove(t) {
     eq(r.uci, 'd2d4', 'a proven mate is never traded away for a random slip, even at 400 ELO with mistakes on');
   }
   {
-    // ... and a level that only sees depth 1 keeps playing its own move when the mate sits deeper
+    // Ordinary moves stay at depth 1, but the shortest-mate policy can still use an engine-proven mate found later.
     const r = await autoplayCase({ autoplayElo: 400, mateMode: 'shortest', mistakes: false }, MATE_PLAN);
-    eq(r.uci, 'e2e4', 'a mate the level is too shallow to reach does not change what it plays');
+    eq(r.uci, 'd2d4', 'shortest-mate style takes a mate proved deeper than the selected level');
+    ok(/shortest verified mate M3/.test(r.status), 'the deep mate is clearly reported: ' + r.status);
+  }
+  {
+    // The shortest-mate choice is also visible in the headline and first arrow, not just auto-play.
+    const t = await boot({ elo: 400, time: 1, auto: false, autoplay: false, mateMode: 'shortest',
+      mistakes: false, open: true }, MATE_PLAN);
+    const { win, doc } = t;
+    click(win, doc.querySelector('#ct-analyze'));
+    eq(await until(() => doc.querySelector('#ct-bestmove').textContent === 'd4' ? 'd4' : false), 'd4',
+      'the headline switches to the deep mate selected by shortest-mate style');
+    ok(/shortest verified mate M3/.test(t.status()), 'the status explains the selected mate: ' + t.status());
+    ok(doc.querySelector('svg.ct-overlay g.ct-a0 polyline'), 'the selected mate is the first arrow');
+    const afterSearch = t.goCount();
+    click(win, doc.querySelector('#ct-elomove'));
+    ok(await until(() => /mate in 3/.test(doc.querySelector('#ct-elotxt').textContent)),
+      'What would X play reuses the selected mate proof: ' + doc.querySelector('#ct-elotxt').textContent);
+    eq(t.goCount(), afterSearch, 'reusing the full candidate lines does not launch a redundant search');
+    win.close();
   }
   {
     // ---------- 3e. the aggressive hunter: it does reach the deep mate, and it says so ----------
@@ -366,11 +383,18 @@ async function firstPlayedMove(t) {
   // ---------- 4a. the Natural mistakes switch: the pick changes and the setting is stored ----------
   {
     const t = await boot({ elo: 400, time: 2, auto: false, autoplay: false, mateMode: 'shortest',
-      mistakes: true, open: true, __rand: 0.5 }, { depths: 4 });
+      mistakes: true, showTop3: false, open: true, __rand: 0.5 }, { depths: 4 });
     const { win, doc, log } = t;
     const before = t.goCount();
     click(win, doc.querySelector('#ct-analyze'));
     ok(await until(() => t.goCount() > before), 'the position gets analysed');
+    ok(await until(() => /Thought/.test(t.status())), 'the candidate search finishes');
+    ok(t.log.cmds.includes('setoption name MultiPV value 3'),
+      'hiding the Top 3 arrows does not collapse the mistake/mate candidate search to one line');
+    const afterAnalysis = t.goCount();
+    setSwitch(win, doc.querySelector('#ct-top3'), true);
+    await tick(20);
+    eq(t.goCount(), afterAnalysis, 'showing/hiding Top 3 arrows does not launch a redundant new search');
     click(win, doc.querySelector('#ct-elomove'));
     ok(await until(() => /a likely inaccuracy at 400 ELO/.test(doc.querySelector('#ct-elotxt').textContent)),
       'with mistakes on, the ELO button answers with a candidate line: ' + doc.querySelector('#ct-elotxt').textContent);
