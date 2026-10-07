@@ -1,6 +1,44 @@
-CHESS TUTOR 1.8
+CHESS TUTOR 1.8.1
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
+
+UPDATE 1.8.1 (hunter audit - see HUNTER-AUDIT.md for the measurements)
+The aggressive hunter was re-measured on 238 real positions against a strong reference search. The style is
+aggressive (it leaves the engine's top line in about 70% of positions) and its mate handling is sound; the audit
+found one defect with a user-visible effect and two hardening fixes, none of which changes the style itself:
+
+* Defect: the quiet fallback could play a move the same search had just scored far outside the risk dial. When no
+  attacking candidate passed the dial, the hunter used to play line 1 of its pool no matter what that line
+  scored - and at a low level line 1 is the depth-1 line, so a 400 ELO hunter could answer a 12-candidate search
+  with a move that search had already scored a piece down. It now plays the best line the hunter can see; the
+  level's own top line still wins whenever it is inside the same budget, so ordinary positions still play at the
+  level's strength. Before the fix: 1 blunder and 6 mistakes (>=1.5 pawns) in 238 positions at 400 ELO; after:
+  0 blunders and 2 mistakes (those two are deliberate baits at the "Very aggressive" setting - see below).
+* Hardening: the pool could lose the deep proof. A wide list at the level's depth could fill the whole
+  pool before the deepest iteration was read; a third of it is now reserved for the deep iteration, so the
+  mate the level is too shallow to see always has a seat at the table.
+* Hardening: the forced-mate rule now runs in one place, before the style split, instead of inside the hunter
+  branch. It was not broken (the hunter checked its own pool for a mate first), but the mate check and the
+  aggression pick lived in the same function, where any later filter could have been put in front of it - and
+  the audit's mate run proved the promise ("the mate in the fewest moves, including one only the deepest
+  iteration proved") holds for every style, so it is now pinned there.
+
+WHAT THE AUDIT SAYS ABOUT "VERY AGGRESSIVE" (the default risk dial)
+The dial is the engine's own evaluation, but it is measured by the search that produced the candidate - and the
+real cost shows up when a deeper search looks again. On the 74 positions where the dial changes the pick:
+
+    Sound (0.3)             mean 14 cp, worst 103 cp, 0 picks >=150
+    Balanced (0.6)          mean 31 cp, worst 104 cp, 0 picks >=150
+    Very aggressive (1.2)   mean 70 cp, worst 252 cp, 3 picks >=150 (all of them baits)
+
+So "Very aggressive" is where the moves that look like blunders come from, and the bait - a piece offered on
+purpose - is the riskiest part (3 baits, mean 121 cp true cost). Two of the three >=150 cp picks are the two
+"mistakes" a user reported with Natural mistakes off: in hunter mode the mistake roll is skipped by design, so
+what looked like a slip was the style's own aggression pick, and the panel labels it ("hunter: check + bait (5 pts
+offered)"). If you want the attack without that price, set Hunter risk to Sound or Balanced (or give it a longer
+Think time: with 5s instead of 1.2s the same position picked a sound move).
+Mate handling itself held up: on every mate position the hunter, the fewest-move style and the regular style all
+took the mate, at Full engine and at 400 ELO, and the hunter at 400 even found the faster mate in two of them.
 
 UPDATE 1.8
 Reload the unpacked extension at chrome://extensions, approve the new unlimitedStorage permission if
@@ -110,6 +148,12 @@ HUNTER RISK (shown only while the hunter is selected)
                                which is the "the attack is winning anyway, play it" case
     The dial is not a promise to play badly: the engine's own evaluation is the guard rail, so the hunter attacks
     with sound moves. A bait that the engine scores as losing (say -3.0) is refused at every setting.
+    What the dial costs when a deeper search looks again (measured on the 74 audit positions where it changed the
+    pick): Sound mean 14 cp, worst 103; Balanced mean 31, worst 104; Very aggressive mean 70, worst 252, with
+    three >=150 cp picks, all of them baits. The dial is measured by the search that produced the candidate, so
+    a short Think time makes it optimistic - the same position that cost 1.2 pawns at 1.2s picked a sound move
+    at 5s. Very aggressive is the default because it is the flashiest; Sound/Balanced is the choice when the
+    move should still be objectively good.
 
 WHAT THE HUNTER ACTUALLY DOES WITH THE ENGINE
     - it asks for 12 MultiPV candidates instead of 5, because a bait or a checking move is usually nowhere near
@@ -122,8 +166,13 @@ WHAT THE HUNTER ACTUALLY DOES WITH THE ENGINE
       was never traded away for a slip in any style).
     - the hunter's candidates come from the deepest iteration the search reached as well as the level's own depth,
       so the ELO level matters less while it is attacking: at 400 ELO + hunter + a 5s think time it plays the
-      attack (or the mate) that the whole 5 seconds of searching proved, not the depth-1 line. The level still
-      decides when nothing aggressive is available (then its own top line is played), and mistakes stay off.
+      attack (or the mate) that the whole 5 seconds of searching proved, not the depth-1 line. The level's own
+      top line still wins the quiet answer whenever it is inside the same risk budget; it is not allowed to win
+      it while the hunter's own search scores that line outside the budget, because at a low level that excuse
+      was a depth-1 line the same search had already rejected (the 1.8.1 audit). In practice that makes the
+      hunter's pick level-independent in nearly every position (measured: identical at 400 ELO and Full engine
+      in all 238 audit positions) - if you want the ELO to shape the move, use the two non-hunter styles, or
+      Natural mistakes with them. Mistake-free: the roll stays off in hunter mode at every ELO.
     - the panel says what it saw, e.g. "hunter: check + bait (3 pts offered)" or "hunter mate M3", so an unusual
       move is explainable instead of mysterious.
 What a mate-proof can reach is bounded by how deep the search got, so deeper mates still need Think time (and the

@@ -333,8 +333,42 @@ eq(L.chooseMove(levelLines, { mateMode: 'shortest', fen: HUNT_FEN, mistakes: fal
   'the other styles still answer from the level depth alone');
 eq(L.chooseMove(deepPool, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very' }).uci, 'h1h8',
   'the hunter takes a mate that only the deepest iteration proved');
-eq(L.huntPool(levelLines, deepLines, 1).length, 1, 'the pool is capped, so a huge MultiPV list cannot blow it up');
+ok(L.huntPool(levelLines, deepLines, 1).length, 1, 'the pool is capped, so a huge MultiPV list cannot blow it up');
 eq(L.huntPool([], []).length, 0, 'no lines -> no candidates');
+/* ---- 12b. the deep proof must survive a wide level list, and the dial must cover the quiet fallback ----
+   Both of these were audit findings: the hunter's promise is "a mate the level is too shallow to reach is still
+   played", but a full MultiPV list at the level's depth used to fill the pool before the deep iteration was
+   read, and when nothing aggressive passed the risk dial the fallback could be a move the same search scored
+   far outside it. */
+{
+  const wide = [];
+  for (let i = 0; i < 24; i++) wide.push({ move: 'a1a' + (i % 8) + '' , type: 'cp', score: 20 - i, depth: 1 });
+  const mateDeep = [{ move: 'h1h8', type: 'mate', score: 3, depth: 26 }];
+  const pooled = L.huntPool(wide, mateDeep);
+  ok(pooled.some(l => l.move === 'h1h8' && l.type === 'mate'),
+    'a mate found only by the deepest iteration is in the pool even when the level alone exceeds the cap');
+  eq(L.chooseMove(pooled, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very', mistakes: false }).uci, 'h1h8',
+    'and the hunter plays it: the mate rule runs before the aggression pick and the risk dial');
+  eq(L.chooseMove(pooled, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'sound', mistakes: false }).mate.score, 3,
+    'sound, balanced or very: a proven mate is never filtered out by the risk dial');
+  // the same pool, but with the level's own move as a real aggressive candidate: the mate still wins
+  const withBait = [{ move: 'f3g5', type: 'cp', score: 25, depth: 1 }].concat(wide.slice(0, 12), mateDeep);
+  eq(L.chooseMove(withBait, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very', mistakes: false }).uci, 'h1h8',
+    'the aggression pick cannot outrank a proven mate that only the deep iteration found');
+}
+{
+  // a 400 ELO hunter whose own depth-1 line is a piece down, with no aggressive move inside the dial
+  const shallowLine = { move: 'e1e2', type: 'cp', score: -350, depth: 1 };
+  const deepBest = { move: 'b1c3', type: 'cp', score: 30, depth: 26 };
+  const quietPool = L.huntPool([shallowLine], [deepBest, { move: 'a1a2', type: 'cp', score: -400, depth: 26 }]);
+  eq(L.chooseMove(quietPool, { mateMode: 'hunter', fen: '4k3/8/8/8/8/8/8/4K2R w - - 0 1', huntRisk: 'very', mistakes: false }).uci, 'b1c3',
+    'nothing aggressive: the fallback is the best line the hunter can see, not a line outside its own dial');
+  // ...but an ordinary position still plays the level's own line when that line is sound
+  const levelLine = { move: 'e1e2', type: 'cp', score: 25, depth: 1 };
+  const pool2 = L.huntPool([levelLine], [{ move: 'e1f1', type: 'cp', score: 30, depth: 26 }]);
+  eq(L.chooseMove(pool2, { mateMode: 'hunter', fen: '4k3/8/8/8/8/8/8/4K2R w - - 0 1', huntRisk: 'sound', mistakes: false }).uci, 'e1e2',
+    'a sound level line still wins the quiet fallback: the level keeps deciding when there is no attack');
+}
 
 
 

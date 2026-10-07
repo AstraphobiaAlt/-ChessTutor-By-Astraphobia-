@@ -449,15 +449,23 @@
   /* One candidate list out of two: the level's own depth first (line 1 of it stays the reference for "the
      engine's best move"), then the deepest iteration the think time reached. A move that appears in both keeps
      the better-informed line - see deeperLine - which is what lets a 400 ELO hunter play a mate that only the
-     long search proved, and gives the aggression pick more than a handful of candidates. */
+     long search proved, and gives the aggression pick more than a handful of candidates.
+     The deepest iteration always gets room: a wide MultiPV list at the level's depth once filled the pool on its
+     own and the deep proof - the whole reason the hunter reads the deep iteration - was dropped on the floor.
+     `reserve` slots are therefore held back for it (a third of the cap, at least one) before the level's own
+     lines may use the rest. */
   function huntPool(lines, deepLines, cap) {
-    var out = [], at = {}, max = cap || 24;
-    [lines, deepLines].forEach(function (arr) {
+    var out = [], at = {}, max = cap > 0 ? cap : 24;
+    var deep = (deepLines || []).filter(function (l) { return l && l.move; });
+    var reserve = deep.length ? Math.min(deep.length, Math.max(1, Math.ceil(max / 3))) : 0;
+    var firstCap = Math.max(1, max - reserve);
+    [lines, deep].forEach(function (arr, pass) {
+      var limit = pass === 0 ? firstCap : max;
       (arr || []).forEach(function (l) {
         if (!l || !l.move) return;
         var seen = at[l.move];
         if (seen !== undefined) { out[seen] = deeperLine(out[seen], l); return; }
-        if (out.length >= max) return;
+        if (out.length >= limit) return;
         at[l.move] = out.length; out.push(l);
       });
     });
@@ -486,8 +494,15 @@
         pick = { line: l, traits: t, score: score };
       }
     });
-    if (!pick) return { uci: list[0].move, line: list[0], mate: null, hunt: moveTraits(fen, list[0].move), mistake: false };
-    return { uci: pick.line.move, line: pick.line, mate: null, hunt: pick.traits, mistake: false };
+    if (pick) return { uci: pick.line.move, line: pick.line, mate: null, hunt: pick.traits, mistake: false };
+    /* Nothing aggressive passed the dial, so the quiet line is played - and the dial still applies to it. It
+       used to play the first line of the pool no matter what that line scored, which with a low ELO level is the
+       depth-1 line: a hunter could answer a wide search with a move the very same search scored a piece down
+       (the "why did the aggressive bot blunder with Natural mistakes off?" report). The pool is what the hunter
+       was given, so its own best line is the honest quiet answer; the level's top line still wins whenever it is
+       inside the same budget, so an ordinary position still plays at the level's strength. */
+    var quiet = lineValue(list[0]) >= floor ? list[0] : best;
+    return { uci: quiet.move, line: quiet, mate: null, hunt: moveTraits(fen, quiet.move), mistake: false };
   }
 
   /* ---- which move to actually play (auto-play and "what would X play?") ----
@@ -511,15 +526,19 @@
     opt = opt || {};
     var list = (lines || []).filter(function (l) { return l && l.move; });
     if (!list.length) return null;
-    if (opt.mateMode === 'hunter') {
-      if (opt.fen) return huntPick(list, opt.fen, opt);
-      var huntMate = fastestMateLine(list);
-      if (huntMate) return { uci: huntMate.move, line: huntMate, mate: huntMate, hunt: null, mistake: false };
-    }
+    /* The forced mate comes first, before the style split, so there is exactly one place that answers it and no
+       style (or aggression/risk filter added later) can get in front of it. Both mate-hunting styles promise the
+       same thing - a proven mate is never traded away - and the hunter's pool carries the deepest iteration, so
+       fastestMateLine here returns the smallest positive mate score in the whole pool: the mate in the fewest
+       moves, whoever's search proved it. The hunter still labels its own mate, so the panel keeps naming the
+       style that took it. */
     if (opt.mateMode !== 'normal') {
       var mate = fastestMateLine(list);
-      if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: null, mistake: false };
+      if (mate) return { uci: mate.move, line: mate, mate: mate,
+        // the hunter labels its mate as the hunter's, so the panel keeps naming the style that took it
+        hunt: opt.mateMode === 'hunter' && opt.fen ? moveTraits(opt.fen, mate.move) : null, mistake: false };
     }
+    if (opt.mateMode === 'hunter' && opt.fen) return huntPick(list, opt.fen, opt);
     var best = list[0];
     if (opt.mistakes) {
       var moves = list.map(function (l) { return l.move; });
