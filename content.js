@@ -218,7 +218,7 @@
     }
     async init() {
       const frame = document.createElement('iframe');
-      frame.src = chrome.runtime.getURL('engine.html');
+      frame.src = chrome.runtime.getURL('engine-host.html');
       frame.style.cssText = 'position:fixed;width:0;height:0;border:0;opacity:0;pointer-events:none;left:0;top:0;';
       this.frame = frame;
       const loaded = new Promise((res, rej) => { this._loaded = res; this._fail = rej; });
@@ -227,6 +227,8 @@
         if (e.source !== frame.contentWindow || !e.data || !e.data.ct) return;
         const d = e.data;
         if (d.error) { setStatus('Engine error: ' + d.error); if (d.fatal) this._fail(new Error(d.error)); }
+        if (d.cacheSaved) { this.cachePersisted = true; this.cacheError = null; showEngine(); }
+        if (d.cacheSaveError) { this.cacheError = d.cacheSaveError; showEngine(); }
         if (d.note) console.info('[Chess Tutor] ' + d.note);
         if (d.stage) { this.lastStage = d.stage; this.onStage(d.stage); this._idle(); }
         if (d.ctCacheGet) this.cacheGet(d);
@@ -1088,7 +1090,7 @@
       el.verify.className = 'warn'; el.verify.textContent = 'Checking engine...';
       engine = e;
       // ask for persistent storage once the panel is up, so Chrome keeps the engine instead of evicting it
-      askPersistentStorage().then(p => { e.cachePersisted = p; showEngine(); }).catch(() => {});
+      askPersistentStorage().then(p => { if (e.cachePersisted !== true) e.cachePersisted = p; showEngine(); }).catch(() => {});
       await e.init();
       showEngine(); setStatus('Ready');
       if (S.auto || S.autoplay) analyze();
