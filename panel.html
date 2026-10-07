@@ -39,7 +39,7 @@
       <span id="ct-timeval" class="ct-val">5s</span>
     </div>
     <div class="ct-field">
-      <span class="ct-label" title="Fewest moves: when the engine proves a mate, auto-play takes the shortest one. Aggressive hunter: it hunts the mate at the full depth the think time reached, and when there is no mate it plays the most aggressive sound move - checks, baits (a piece offered), attacks on the king, and sustained pressure in the calculated continuation. No guaranteed traps or mate in five. Regular: it simply plays the best line of the search.">Checkmate style</span>
+      <span class="ct-label" title="Fewest moves: takes the shortest mate the engine proves anywhere in the think-time search; ordinary moves stay at the selected level. Aggressive hunter: takes the shortest proven mate, or prefers a sound attack - checks, newly offered pieces, attacks on the king, and sustained pressure. It can give up up to the selected Hunter risk in evaluation for pressure. No guaranteed traps or mate in five. Regular: it simply plays the best line of the search.">Checkmate style</span>
       <select id="ct-mate" aria-label="Checkmate style">
         <option value="shortest">Mate in the fewest moves</option>
         <option value="hunter">Aggressive hunter</option>
@@ -54,7 +54,7 @@
         <option value="very">Very aggressive (1.2)</option>
       </select>
     </div>
-    <label class="ct-switch" title="On: a low ELO level sometimes picks a reasonable-looking move instead of the best one, like a real player. Off: it always plays its own best line. Never applies while a proven mate is on the board."><span>Natural mistakes</span><input type="checkbox" id="ct-mistakes"></label>
+    <label class="ct-switch" title="On: a low ELO level sometimes deviates to another engine candidate. Off: disables only that random deviation; a shallow search can still miss tactics, and mate style can deliberately pick another move. The aggressive hunter ignores this switch."><span>Natural mistakes</span><input type="checkbox" id="ct-mistakes"></label>
     <div class="ct-field">
       <span class="ct-label">Memory (hash)</span>
       <select id="ct-hash" aria-label="Hash memory">
@@ -73,7 +73,7 @@
     </div>
 
     <label class="ct-switch"><span>Best move</span><input type="checkbox" id="ct-best"></label>
-    <label class="ct-switch"><span>Top 3 moves</span><input type="checkbox" id="ct-top3"></label>
+    <label class="ct-switch" title="Show or hide the extra arrows only. The engine keeps its candidate lines for mate checks and Natural mistakes either way."><span>Top 3 moves</span><input type="checkbox" id="ct-top3"></label>
     <label class="ct-switch"><span>Auto-analyze</span><input type="checkbox" id="ct-auto"></label>
     <label class="ct-switch"><span>Auto-play</span><input type="checkbox" id="ct-autoplay"></label>
     <div class="ct-field" id="ct-autoplay-elorow">

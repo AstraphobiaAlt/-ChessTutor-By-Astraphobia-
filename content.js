@@ -376,12 +376,19 @@
       const m = (best === null ? null : this.byDepth[best]) || {};
       const lines = Object.keys(m).map(Number).sort((x, y) => x - y).map(k => m[k]);
       const deepest = ds.length ? this.byDepth[Math.max(...ds)] : {};
-      // the deepest iteration the think time reached, as candidate lines too. Only the hunter uses them (a long
-      // think time can prove a mate a low level's own depth is nowhere near), but they are reported always so a
-      // caller can see how far the search really got.
+      // the deepest iteration the think time reached, as candidate lines too. The hunter uses these for pressure
+      // picks that a low ELO's own depth never saw.
       const deepLines = Object.keys(deepest).map(Number).sort((x, y) => x - y).map(k => deepest[k]);
+      // Keep every positive mate proof reported during this search, not just the selected ELO depth or the final
+      // (possibly half-filled) MultiPV depth. Shortest-mate styles can then take advantage of the whole think-time
+      // search without making all ordinary low-ELO moves come from the deepest iteration.
+      const mateLines = [];
+      ds.forEach(d => Object.keys(this.byDepth[d]).forEach(k => {
+        const line = this.byDepth[d][k];
+        if (line && line.type === 'mate' && line.score > 0) mateLines.push(line);
+      }));
       const top = ds.length ? this.byDepth[Math.max(...ds)][1] || lines[0] : null;   // latest stats for line 1
-      cur.resolve({ lines, deepLines, eager: !!eager,
+      cur.resolve({ lines, deepLines, mateLines, eager: !!eager,
         // how deep the engine actually got inside the think time: the panel shows it, so a low level that thinks
         // long is visibly "searching harder than it plays" rather than looking stuck
         searchDepth: ds.length ? Math.max(...ds) : null,
@@ -526,12 +533,15 @@
     const timing = S.time > 0
       ? 'It thinks ' + fmtSecs(S.time) + ' for every move at any level, then plays at once - no extra delay.'
       : 'It plays the first complete result at once.';
-    const mateGoal = S.mateMode === 'shortest' ? 'A proven forced mate is taken in the fewest moves.'
-      : S.mateMode === 'hunter' ? 'Hunter: the fewest-move mate whenever one is proven (even if only the deepest '
-        + 'iteration found it), otherwise the most aggressive sound move - check, bait, attack on the king. Its '
-        + 'candidates come from the whole depth the search reached, so the level matters less while it attacks.'
-      : 'Regular play: its best line, no mate hunting.';
-    const slip = S.mistakes ? 'Natural mistakes are on, so a low level slips like a person.' : 'Mistakes are off: it always plays its own best line.';
+    const mateGoal = S.mateMode === 'shortest' ? 'A proven mate found anywhere in the think-time search is taken in the fewest moves; otherwise it uses the selected level.'
+      : S.mateMode === 'hunter' ? 'Hunter: the fewest-move mate whenever one is proven, otherwise the most aggressive sound move - check, bait, attack on the king. Its '
+        + 'pressure candidates use the whole depth the search reached, so the level matters less while it attacks.'
+      : 'Regular play: its best line at the selected level, no mate hunting.';
+    const slip = S.mateMode === 'hunter'
+      ? 'Hunter choices are deliberate; Natural mistakes is ignored in this style.'
+      : S.mistakes
+        ? 'Natural mistakes are on, so a low level sometimes deviates from its best line.'
+        : 'Natural mistakes are off: there is no random deviation. A shallow level can still miss tactics, and mate style may choose a different move.';
     el.autohint.textContent = (S.autoplay ? 'On: ' + who + ' at ' + at + '. ' : 'Off - turn on to play ' + who + ' at ' + at + '. ')
       + timing + ' ' + mateGoal + ' ' + slip;
     el.autohint.classList.toggle('on', S.autoplay);
@@ -585,9 +595,9 @@
     const goal = S.mateMode === 'shortest' ? ', preferring the shortest proven mate'
       : S.mateMode === 'hunter' ? ', hunting mate / check / bait (' + huntLabel() + ')' : ', regular best move';
     setStatus((S.time > 0 ? 'Thinking for ' + fmtSecs(S.time) + ' (' + strength + goal + ')...' : 'Searching (' + strength + goal + ')...'));
-    // Auto-play gets multiple PVs so it can choose the shortest engine-verified mating line, and so a natural
-    // mistake has real candidate moves to pick from instead of a single engine line. The hunter asks for more of
-    // them (plus the deepest iteration, below) because a bait is often nowhere near line 1.
+    // The search keeps multiple PVs for mate proofs and, when enabled, realistic candidate deviations, independent
+    // of whether their arrows are shown. Auto-play gets five; the hunter asks for more (plus the deepest iteration)
+    // because a check or bait can sit well below the quiet top lines.
     const r = await engine.analyze(pos.fen, lim, mpvFor());
     if (!r) return;                                           // superseded by a newer request
     if (seq !== analysisSeq) return;
@@ -597,9 +607,19 @@
     const pool = huntPoolFor(r);                              // hunter: level depth + deepest iteration
     // In hunter mode the headline move and arrow 1 ARE the hunter's choice, so what the panel shows is what the
     // style would actually play; the engine's remaining candidates follow it. The other styles show the search.
-    const huntPickInfo = huntOn() ? L.chooseMove(pool, pickOpts(pos.fen, S.autoplay ? autoplayEloKey() : eloKey())) : null;
-    const shown = huntPickInfo ? [huntPickInfo.line].concat(pool.filter(l => l.move !== huntPickInfo.uci)) : r.lines;
-    lastResult = { fen: pos.fen, lines: shown, turn: pos.turn };
+    const mateLines = r.mateLines || [];
+    const styleOpts = pickOpts(pos.fen, S.autoplay ? autoplayEloKey() : eloKey(), mateLines);
+    const huntPickInfo = huntOn() ? L.chooseMove(pool, styleOpts) : null;
+    const shortestPickInfo = S.mateMode === 'shortest' ? L.chooseMove(r.lines, styleOpts) : null;
+    const displayPick = huntPickInfo || (shortestPickInfo && shortestPickInfo.mate ? shortestPickInfo : null);
+    const displayPool = huntPickInfo ? pool : r.lines;
+    // Show an intentional style choice as the headline/first arrow: the hunter's pressure pick, or a proven
+    // shortest mate. Keep only same-depth alternatives so arrows do not mix evaluations from different iterations.
+    // Without a deliberate choice, keep the regular search line visible (including any Natural-mistake model).
+    const shown = displayPick
+      ? [displayPick.line].concat(displayPool.filter(l => l.move !== displayPick.uci && l.depth === displayPick.line.depth))
+      : r.lines;
+    lastResult = { fen: pos.fen, lines: shown, choiceLines: pool, turn: pos.turn, mateLines: mateLines };
     const top = shown[0];
     el.best.textContent = L.uciToSan(top.move, pos.fen); el.best.title = top.move;
     el.eval.textContent = L.evalText(top, pos.turn);
@@ -611,7 +631,7 @@
       (r.searchDepth > top.depth ? ' (searched to ' + r.searchDepth + ')' : '') + ' \u00B7 ' +
       L.fmtCount(r.stats.nodes) + ' nodes' +
       (r.stats.nps ? ' \u00B7 ' + Math.round(r.stats.nps / 1000) + ' kn/s' : '');
-    const forcedMate = L.fastestMateLine(pool);
+    const forcedMate = L.fastestMateLine(pool.concat(mateLines));
     if (forcedMate && S.mateMode === 'shortest') msg += ' · shortest verified mate M' + forcedMate.score;
     else if (huntPickInfo) {
       // say what the hunter is going for, so an unusual move is visible in the panel instead of mysterious
@@ -630,7 +650,7 @@
     }
     setStatus(msg);
     render();
-    if (S.autoplay) autoPlay(pos, pool).catch(() => {});
+    if (S.autoplay) autoPlay(pos, pool, mateLines).catch(() => {});
   }
 
   // ---------- Auto-play ----------
@@ -643,24 +663,25 @@
   const ourTurn = pos => pos.mover === sideForPosition(pos);
   const labelForPlay = () => autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
 
-  // Mate mode picks the line: 'shortest' takes the fewest-move mate the engine proved, 'normal' just plays the
-  // top line at the Auto-play ELO, and 'hunter' plays the most aggressive sound candidate (see lib.js huntPick).
-  // Natural mistakes then get the low-ELO deviation roll - skipped while a proven mate is on the board and
-  // skipped in hunter mode entirely, so a forced win (or a deliberate attack) is never thrown away to look human.
+  // Mate mode picks the line: 'shortest' takes the fewest-move mate proved anywhere in the think-time search,
+  // 'normal' just plays the selected-depth top line, and 'hunter' prefers the most aggressive sound candidate.
+  // Natural mistakes only add random deviations to non-mate choices; they never discard a proven mate, and the
+  // hunter never rolls because its attacking choice is deliberate (see lib.js chooseMove / huntPick).
   const huntOn = () => S.mateMode === 'hunter';
-  // A bait or a checking move often sits further down the MultiPV list than line 3, so the hunter asks for more
-  // candidates. It costs search speed (MultiPV splits the same think time), which is the price of the style.
-  const MPV_HUNTER = 12;
-  const mpvFor = () => huntOn() ? MPV_HUNTER : (S.autoplay ? 5 : S.showTop3 ? 3 : 1);
-  // Hunter looks at the level's own depth AND the deepest iteration the think time reached, so a low ELO level
-  // still spots (and takes) a forced mate the long search proved. Other styles keep the level's depth promise.
+  // Search candidate counts are independent of the arrow-display switch: hiding Top 3 must not silently disable
+  // natural deviations or shrink mate coverage to one PV. The hunter asks for more because checks/baits can rank
+  // well below the quiet top lines; MultiPV splits the same think time, which is the cost of that style.
+  const MPV_HUNTER = 12, MPV_AUTOPLAY = 5, MPV_STANDARD = 3;
+  const mpvFor = () => huntOn() ? MPV_HUNTER : (S.autoplay ? MPV_AUTOPLAY : MPV_STANDARD);
+  // For non-mate pressure the hunter looks at its level's depth AND the deepest iteration. All mate-seeking styles
+  // also receive the engine's positive mate proofs from every completed depth; ordinary moves remain level-capped.
   const huntPoolFor = r => huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
-  const pickOpts = (fen, elo) => ({ elo: elo, mistakes: S.mistakes, mateMode: S.mateMode,
-    huntRisk: S.huntRisk, fen: fen, rand: Math.random });
+  const pickOpts = (fen, elo, mateLines) => ({ elo: elo, mistakes: S.mistakes, mateMode: S.mateMode,
+    huntRisk: S.huntRisk, fen: fen, rand: Math.random, mateLines: mateLines || [] });
   const huntLabel = () => (S.huntRisk === 'sound' ? 'sound' : S.huntRisk === 'balanced' ? 'balanced' : 'very aggressive');
 
-  function pickForAutoplay(lines, fen) {
-    return L.chooseMove(lines, pickOpts(fen, autoplayEloKey()));
+  function pickForAutoplay(lines, fen, mateLines) {
+    return L.chooseMove(lines, pickOpts(fen, autoplayEloKey(), mateLines));
   }
   // " · hunter: check + bait (3 pts offered)" - what the aggressive pick was going for
   const huntNoteOf = pick => huntOn() && pick && pick.hunt ? L.huntNote(pick.hunt) : '';
@@ -671,11 +692,11 @@
   // Play one move for the analyzed position. Nothing here trusts the analysis: the board is re-read, and the
   // move goes through chess.com's own legal-move list (page-bridge), so a stale position simply does nothing.
   // There is intentionally no extra pace timer: Think time was already spent searching for this move.
-  async function autoPlay(pos, lines) {
+  async function autoPlay(pos, lines, mateLines) {
     if (!S.autoplay || playing || !engine || !engine.ready || !lines || lines.length < 1 || !ourTurn(pos)) return;
     const key = keyOf(pos);
     if (playAttempt && playAttempt.key === key && playAttempt.ok) return;      // already moved for this position
-    const choice = pickForAutoplay(lines, pos.fen);
+    const choice = pickForAutoplay(lines, pos.fen, mateLines);
     if (!choice) return;
     // Yield only to the board/FEN request needed for stale-move protection; the move itself goes straight out.
     const now = await readPosition();
@@ -747,14 +768,18 @@
   async function whatWouldEloPlay() {
     if (!lastResult) { await analyze(); if (!lastResult) return; }
     const base = lastResult;
-    let lines = base.lines;
+    let lines = base.choiceLines || base.lines;
+    let mateLines = base.mateLines || [];
     if (lines.length < 3 && engine && engine.ready) {
       const r = await engine.analyze(base.fen, limits(), mpvFor());
       if (!lastResult || lastResult.fen !== base.fen) return;
-      if (r && r.lines.length) lines = r.deepLines && huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
+      if (r && r.lines.length) {
+        lines = r.deepLines && huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
+        mateLines = mateLines.concat(r.mateLines || []);
+      }
     }
     const eloForPick = S.custom ? 1200 : eloKey();
-    const pick = L.chooseMove(lines, pickOpts(base.fen, eloForPick));
+    const pick = L.chooseMove(lines, pickOpts(base.fen, eloForPick, mateLines));
     if (!pick) return;
     const best = lines.map(l => l.move)[0];
     lastEloMove = pick.uci;
@@ -993,7 +1018,7 @@
     el.mistakes.addEventListener('change', () => {
       S.mistakes = el.mistakes.checked;
       saveSettings(); updateTip(); updateAutoHint();
-      if (lastResult) rerunSoon();          // the pick changes: its arrow should not keep pointing at the old slip
+      if (lastResult && !huntOn()) rerunSoon();   // update a random pick; the deliberate hunter is unaffected
     });
     el.autoplay.addEventListener('change', () => {
       S.autoplay = el.autoplay.checked; saveSettings(); updateAutoHint();
@@ -1015,7 +1040,7 @@
     el.hash.addEventListener('change', () => { S.hash = +el.hash.value; saveSettings(); if (engine && engine.ready) { engine.setHash(S.hash); showEngine(); } });
     el.side.addEventListener('change', () => { S.side = el.side.value; saveSettings(); updateAutoHint(); rerun(); });
     el.bestCb.addEventListener('change', () => { S.showBest = el.bestCb.checked; saveSettings(); render(); });
-    el.top3.addEventListener('change', () => { S.showTop3 = el.top3.checked; saveSettings(); rerun(); });
+    el.top3.addEventListener('change', () => { S.showTop3 = el.top3.checked; saveSettings(); render(); });
     el.auto.addEventListener('change', () => { S.auto = el.auto.checked; saveSettings(); });
     el.opacity.addEventListener('input', () => { S.opacity = +el.opacity.value; el.opacityVal.textContent = S.opacity + '%'; el.panel.style.opacity = String(S.opacity / 100); });
     el.opacity.addEventListener('change', saveSettings);

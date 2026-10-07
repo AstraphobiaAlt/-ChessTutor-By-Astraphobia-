@@ -83,20 +83,21 @@ from, and Think time decides how long the engine searches. The status line repor
 the tab, so a low level with a 30s window costs the same as a high one.
 
 CHECKMATE STYLE (this really decides the move - it is not a display setting)
-All three styles pick the UCI move that auto-play sends and that "What would X play?" reports; none of them
-changes the arrows, the evaluation or the search itself. Two of them can only act on a mate the engine's own
-search actually proved (a `score mate +N` line), which is why the style can look like it does nothing in a
-position with no forced win. The third one, the hunter, is the one that changes how the engine's candidates are
-USED, so it acts in almost every position:
+All three styles govern the move choice used by auto-play and "What would X play?" A mate is only claimed when
+the engine reports a positive `score mate +N` proof. The shortest-mate style uses those proofs but otherwise uses
+the selected-level move (or a Natural mistakes deviation). The hunter also ranks non-mate candidates for pressure;
+Regular always follows the top line. A selected mate or hunter attack is shown as the headline/first arrow, so the
+panel's main move matches that deliberate choice. Thus mate styles may look like they do nothing in a position
+with no forced win, while the hunter can still prefer a sound check or attack:
 
-    Mate in the fewest moves   when the search proves a win, the shortest engine-verified mate is taken - even if
-                               it was not line 1 of the MultiPV list. A proven mate is never traded away.
-                               No mate proven -> identical move to "Regular best move".
-    Aggressive hunter          every proven mate is taken (fewest moves first), AND it looks for that mate one
-      (checks + bait)         level deeper than the other styles: the candidate list is the level's own depth
-                               PLUS the deepest iteration the Think time reached, so a 400 ELO hunter still plays
-                               a mate in 3 that only the long search proved. With no mate on the board it plays
-                               for pressure instead of the quiet best line: a check, then a bait (a piece it
+    Mate in the fewest moves   the shortest positive mate proof reported anywhere during the think-time search is
+                               taken - even if it was not line 1 of the MultiPV list or was found deeper than the
+                               selected ELO depth. Ordinary non-mate moves still come from the selected level, so
+                               a long think does not silently turn 400 ELO into full engine. With no mate proof,
+                               the selected-depth move (or a Natural mistakes slip, if enabled) is used.
+    Aggressive hunter          every proven mate from the think-time search is taken (fewest moves first), even
+      (checks + bait)         if it was not line 1 or was proved deeper than the selected level. With no mate it
+                               plays for pressure instead of the quiet best line: a check, then a bait (a piece it
                                leaves en prise on purpose), then a move that attacks the enemy king. Every
                                candidate still has to stay within "Hunter risk" of the best line the engine can
                                see, so the attack is sound rather than reckless.
@@ -112,9 +113,9 @@ HUNTER RISK (shown only while the hunter is selected)
     with sound moves. A bait that the engine scores as losing (say -3.0) is refused at every setting.
 
 WHAT THE HUNTER ACTUALLY DOES WITH THE ENGINE
-    - it asks for 12 MultiPV candidates instead of 5, because a bait or a checking move is usually nowhere near
-      line 1 of the search. MultiPV splits the same Think time over more lines, so each iteration is a bit
-      slower - that is the price of the style (and it is only paid while the hunter is selected).
+    - it asks for 12 MultiPV candidates instead of the usual 3 in analysis (5 in auto-play), because a bait or a
+      checking move is often nowhere near line 1. MultiPV splits the same Think time over more lines, so each
+      iteration is slower - that is the search-speed cost, paid only while the hunter is selected.
     - it reads the board itself (a pure attack/defence trace of the position, lib.js moveTraits) to know whether
       a candidate gives check, offers material or points at the enemy king. The tracer only classifies moves the
       engine already produced; chess.com's own legal-move list still decides what can be played.
@@ -130,12 +131,17 @@ What a mate-proof can reach is bounded by how deep the search got, so deeper mat
 hunter also sees the deepest iteration the window reached). "Full engine" plus a few seconds finds long mates.
 
 NATURAL MISTAKES
-    On   (default) a low level sometimes picks a reasonable-looking line from the engine's candidates instead of
-               its best one - 400 ELO slips often, 1800 rarely, 2000+ never. This is what makes a bot level look
-               like a person rather than a machine that forgot to be weak.
-    Off  it always plays the best line its search found at that level, at any ELO.
-The switch also drives the "What would X play?" button, and it is skipped entirely while a proven mate is on the
-board (mate mode on): a forced win is never thrown away to look more natural.
+    On   (default) a low level sometimes makes a random deviation from the best line among the engine's candidate
+               moves - 400 ELO deviates often, 1800 rarely, 2000+ never. When the deviation roll fires, it always
+               chooses a different candidate (the chance matches the level's configured error rate).
+    Off  disables that random deviation. The engine still uses the selected level's search depth, so a shallow
+               search can miss tactics or choose a move that later looks like a mistake. A checkmate style can
+               also deliberately choose a different line: shortest-mate takes a proven mate and the hunter selects
+               an aggressive candidate. The hunter ignores this switch because its attacking move is intentional.
+The switch also drives the "What would X play?" button. Random deviations never replace an engine-proven forced
+mate: the shortest-mate and hunter styles prioritize the fastest proven mate found during the think-time search.
+"Top 3 moves" only hides/shows arrows; it does not remove the candidate lines used for mate checks or random
+mistakes, so hiding arrows cannot silently turn the Natural mistakes setting off.
 
 AUTO-PLAY
 Switch "Auto-play" on and the tutor plays moves itself for the selected "Show moves for" side. It only attempts
@@ -143,9 +149,10 @@ a move when it is genuinely that side's turn, checks the current board position 
 the move through chess.com's own legal-move list. A stale or illegal move is refused instead of forced.
 
 Auto-play ELO is independent from the normal Play level: it is the strength used for the moves it plays. Both
-share Think time, and both get the natural-mistake roll (with the mate exception above). The "Move dispatch" line
-in the panel reads "After 5s thinking" (or "Immediate (instant)" at 0) because that think time is the only wait
-before a move goes out - there is no separate pacing timer.
+share Think time. In shortest-mate and regular styles, the Natural mistakes switch controls random deviations
+(with proven mates protected); the hunter ignores it because its aggressive choices are deliberate. The "Move
+dispatch" line in the panel reads "After 5s thinking" (or "Immediate (instant)" at 0) because that think time is
+the only wait before a move goes out - there is no separate pacing timer.
 
 MOVING THE PANEL
 Move the panel by dragging its title bar. The screen edges do not stop it: push it half past a wall and it stays

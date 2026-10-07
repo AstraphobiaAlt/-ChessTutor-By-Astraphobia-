@@ -20,6 +20,10 @@ function ok(cond, msg) {
 }
 function eq(a, b, msg) { ok(a === b, msg + ' (got ' + JSON.stringify(a) + ', want ' + JSON.stringify(b) + ')'); }
 
+const signedMate = L.parseInfo('info depth 12 multipv 2 score mate +3 nodes 1000 pv d2d4 e8d8');
+eq(signedMate && signedMate.score, 3, 'UCI mate scores with an explicit plus sign parse as winning mate proofs');
+eq(signedMate && signedMate.move, 'd2d4', 'the signed mate line keeps its candidate move');
+
 // ---- 1. a normal search reports the deepest depth that has every line
 const dump = {
   1: { 1: { depth: 1, multipv: 1, move: 'e2e4' } },
@@ -136,7 +140,7 @@ eq2(L.chooseMove([{ move: 'a2a4', type: 'mate', score: -2, depth: 8 }, { move: '
   { elo: 3200, mistakes: false, mateMode: 'shortest' }).uci, 'a2a4',
   'a mate for the opponent is not a winning mate, so the top line stays');
 // natural mistakes
-eq2(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', rand: () => 0.01 }).uci, 'e2e4',
+eq2(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', rand: () => 0.99 }).uci, 'e2e4',
   'a low level with mistakes on still plays the engine move when the roll is clean');
 eq(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', rand: () => 0.5 }).mistake, true,
   'a 400 ELO slip is flagged, so the panel can say it was a mistake');
@@ -146,6 +150,10 @@ eq(L.chooseMove(pickLines, { elo: 400, mistakes: false, mateMode: 'normal', rand
   'with mistakes off nothing is flagged as a slip');
 eq2(L.chooseMove(pickLines, { elo: 400, mistakes: false, mateMode: 'normal', rand: () => 0.0 }).uci, 'e2e4',
   'mistakes off: even 400 ELO plays its best line');
+eq2(L.chooseMove(pickLines, { elo: 400, mistakes: true, mateMode: 'normal', mateLines: [
+  { move: 'b1c3', type: 'mate', score: 2, depth: 20 }
+], rand: () => 0.5 }).uci, 'g1f3',
+  'mate-only search history never leaks into the Natural mistakes candidate draw');
 eq2(L.chooseMove(pickLines, { elo: 3200, mistakes: true, mateMode: 'normal', rand: () => 0.0 }).uci, 'e2e4',
   'full engine strength has no error rate, so mistakes on changes nothing there');
 ok(matePick.map(l => l.move).includes(L.chooseMove(matePick, { elo: 400, mistakes: true, mateMode: 'shortest', rand: () => 0.5 }).uci),
@@ -190,8 +198,9 @@ eq(L.paceWait(1000, 5000), 0, 'a slow search is never slowed down further');
 const lines = [{ move: 'e2e4' }, { move: 'd2d4' }, { move: 'g1f3' }];
 const moves = lines.map(l => l.move);
 eq(L.eloMove('e2e4', moves, 1200, () => 0.99), 'e2e4', 'an accurate roll plays the engine move');
-eq(L.eloMove('e2e4', moves, 1200, () => 0.01), moves[0], 'a slip still plays one of the engine lines');
-ok(moves.includes(L.eloMove('e2e4', moves, 400, () => 0.5)), 'the low-level slip picks a candidate line');
+eq(L.eloMove('e2e4', moves, 1200, () => 0.01), moves[1], 'a triggered slip always deviates from the engine move');
+ok(moves.slice(1).includes(L.eloMove('e2e4', moves, 400, () => 0.5)), 'the low-level slip picks a different candidate line');
+eq(L.eloMove('e2e4', ['e2e4'], 400, () => 0), 'e2e4', 'one legal candidate cannot create a fake mistake');
 eq(L.eloMove('e2e4', moves, 3200, () => 0.001), 'e2e4', 'full engine strength never slips');
 eq(L.eloMove('e2e4', moves, 2000, () => 0), 'e2e4', '2000+ has no error rate in the table');
 eq(L.eloMove('e2e4', [], 400, () => 0), 'e2e4', 'no candidates -> the engine move');
@@ -219,6 +228,11 @@ eq(L.fastestMateLine([
   { move: 'a2a4', type: 'mate', score: 3, depth: 10 },
   { move: 'b2b4', type: 'mate', score: 3, depth: 16 }
 ]).move, 'b2b4', 'a deeper line breaks a same-distance mate tie');
+const lateMate = { move: 'd2d4', type: 'mate', score: 3, depth: 26 };
+eq2(L.chooseMove(pickLines, { mateMode: 'shortest', mistakes: false, mateLines: [lateMate] }).uci, 'd2d4',
+  'shortest-mate style uses a proof from deeper search even when the selected-depth lines have no mate');
+eq2(L.chooseMove(pickLines, { mateMode: 'normal', mistakes: false, mateLines: [lateMate] }).uci, 'e2e4',
+  'regular style ignores deep mate proofs and stays on its top line');
 
 // ---- 10. the aggressive hunter reads the board itself: is that move a check, a bait, an attack on the king?
 // White: Ke1, Rh1, Nf3 / Black: Ke8, pawn h6. Nf3-g5 offers the knight to the h6 pawn and eyes f7.
@@ -239,6 +253,15 @@ eq(L.moveTraits('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1', 'e2e
 // a defended knight on g5 is not a bait: the f4 pawn covers it
 eq(L.moveTraits('4k3/8/7p/8/5P2/5N2/8/4K2R w - - 0 1', 'f3g5').bait, false,
   'a piece the opponent can take but that is defended is a trade, not a bait');
+const alreadyLoose = L.moveTraits('4k3/8/8/8/6p1/5N2/8/4K2R w - - 0 1', 'h1h2');
+eq(alreadyLoose.bait, false, 'an unrelated move does not get a bait label for a piece that was already hanging');
+eq(alreadyLoose.loss, 0, 'the hunter only reports newly offered material');
+const existingRingAttack = '4k3/8/8/8/8/8/8/4KR2 w - - 0 1';
+eq(L.attackedBy(L.fenBoardMap(existingRingAttack), 'f8', 'w'), true, 'the position already has a rook attack on the king ring');
+eq(L.moveTraits(existingRingAttack, 'e1e2').kingAttack, false,
+  'an unrelated king move does not get credit for pressure that already existed');
+eq(L.moveTraits('4k3/8/7p/8/8/8/8/4K2R w - - 0 1', 'h1f1').kingAttack, true,
+  'a rook move that creates a new king-ring attack is credited');
 eq(L.moveTraits(null, 'e2e4'), null, 'without a FEN there is no board to trace');
 eq(L.moveTraits(HUNT_FEN, 'a3a4'), null, 'a move with no piece on its from-square is not traced');
 eq(L.moveTraits('rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1', 'a1a2'), null,
@@ -272,6 +295,11 @@ eq(L.huntNote(jump), 'bait (3 pts offered) + attack on the king', 'the note expl
 ok(L.aggressionScore(hunt(huntLines, {}).hunt) > L.aggressionScore(jump), 'a check outranks a bait');
 eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'f3g5', type: 'cp', score: 25, depth: 20 }], {}).uci, 'f3g5',
   'with no check available the bait is played');
+eq(hunt([
+  { move: 'h1h2', type: 'cp', score: 200, depth: 1 },  // optimistic shallow line
+  { move: 'e1e2', type: 'cp', score: 20, depth: 20 },   // best-informed quiet line
+  { move: 'h1h8', type: 'cp', score: 50, depth: 1 }     // check, still inside the deep line's risk budget
+], {}).uci, 'h1h8', 'the hunter measures risk from the deepest evaluation, not an optimistic shallow score');
 eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }], {}).uci, 'e1e2',
   'nothing aggressive on the board: the hunter just plays the best line');
 // the guard rail: the engine's own evaluation decides how much pressure is affordable

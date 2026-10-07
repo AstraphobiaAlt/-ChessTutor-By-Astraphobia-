@@ -159,16 +159,33 @@
     return { pieces: next, captured: captured, capturedSq: capturedSq, promotion: promo ? promo.toLowerCase() : null };
   }
 
-  /* The most valuable piece of `side` that the opponent can take for free in a position: attacked and not
-     defended. A king never counts (it cannot be captured - that is check). */
+  /* Is a non-king piece of `side` currently attacked and undefended? This is a geometric trace, not a full
+     legal-capture search: pinned attackers/defenders can make the label approximate, and the engine evaluation
+     remains the safety check before the hunter can choose the move. */
+  function isHanging(pieces, sq, side) {
+    var pc = pieces[sq], other = side === 'w' ? 'b' : 'w';
+    return !!pc && sideOf(pc) === side && typeOf(pc) !== 'K' &&
+      attackedBy(pieces, sq, other) && !attackedBy(pieces, sq, side);
+  }
+  /* The most valuable piece of `side` that the opponent can take for free in a position. A king never counts. */
   function hangingValue(pieces, side) {
-    var other = side === 'w' ? 'b' : 'w', worst = 0;
+    var worst = 0;
     for (var sq in pieces) {
-      var pc = pieces[sq];
-      if (sideOf(pc) !== side || typeOf(pc) === 'K') continue;
-      if (!attackedBy(pieces, sq, other)) continue;
-      if (attackedBy(pieces, sq, side)) continue;             // defended = not bait
-      var worth = worthOf(pc);
+      if (!isHanging(pieces, sq, side)) continue;
+      var worth = worthOf(pieces[sq]);
+      if (worth > worst) worst = worth;
+    }
+    return worst;
+  }
+  /* The hunter should call a piece a bait only when this move newly leaves material en prise. Counting every
+     hanging piece in the resulting position made an unrelated quiet move look like a bait whenever the position
+     already contained a loose piece. */
+  function newlyHangingValue(before, after, side) {
+    var worst = 0;
+    for (var sq in after) {
+      if (!isHanging(after, sq, side)) continue;
+      if (before[sq] === after[sq] && isHanging(before, sq, side)) continue;
+      var worth = worthOf(after[sq]);
       if (worth > worst) worst = worth;
     }
     return worst;
@@ -178,6 +195,15 @@
     var ring = kingRing(pieces, side === 'w' ? 'b' : 'w');
     for (var i = 0; i < ring.length; i++) {
       if (attackedBy(pieces, ring[i], side)) return true;
+    }
+    return false;
+  }
+  // Did this move create pressure on a previously unattacked square around the enemy king? Existing pressure
+  // should not make every unrelated move look like an attack.
+  function addsKingRingAttack(before, after, side) {
+    var ring = kingRing(after, side === 'w' ? 'b' : 'w');
+    for (var i = 0; i < ring.length; i++) {
+      if (attackedBy(after, ring[i], side) && !attackedBy(before, ring[i], side)) return true;
     }
     return false;
   }
@@ -198,10 +224,10 @@
     var mv = applyMove(pieces, uci, parts[3] && parts[3] !== '-' ? parts[3] : null);
     if (!mv) return null;
     var gain = worthOf(mv.captured) + (mv.promotion ? worthOf(mv.promotion) - 1 : 0);
-    var loss = hangingValue(mv.pieces, turn);
+    var loss = newlyHangingValue(pieces, mv.pieces, turn);
     return {
       check: sideInCheck(mv.pieces, them), bait: loss >= 2 && loss - gain >= 1,
-      kingAttack: attacksKingRing(mv.pieces, turn), capture: !!mv.captured,
+      kingAttack: addsKingRingAttack(pieces, mv.pieces, turn), capture: !!mv.captured,
       gain: gain, loss: loss, piece: typeOf(pieces[uci.slice(0, 2)])
     };
   }
@@ -215,7 +241,7 @@
   function parseInfo(line) {
     if (line.indexOf('info') !== 0 || line.indexOf(' pv ') < 0 || / (lower|upper)bound/.test(line)) return null;
     var d = /depth (\d+)/.exec(line), mp = /multipv (\d+)/.exec(line);
-    var sc = /score (cp|mate) (-?\d+)/.exec(line), pv = / pv (.+)$/.exec(line);
+    var sc = /score (cp|mate) ([+-]?\d+)/.exec(line), pv = / pv (.+)$/.exec(line);
     if (!d || !sc || !pv) return null;
     var n = /nodes (\d+)/.exec(line), nps = /nps (\d+)/.exec(line), t = /time (\d+)/.exec(line), sd = /seldepth (\d+)/.exec(line);
     var moves = pv[1].trim().split(/\s+/);
@@ -377,15 +403,20 @@
   }
 
   /* ---- ELO deviation (as specified) ----
-     What a player of a given rating would pick out of the engine's candidate lines (best move first).
+     What a player of a given rating would pick out of the engine's candidate lines (best move first). The error
+     rate is the chance of an actual deviation, so when that roll fires the best move is excluded from the draw.
      rand is injectable so the unit tests can drive both branches deterministically. */
   var ERROR_RATES = { 400: 0.75, 600: 0.60, 800: 0.45, 1000: 0.30, 1200: 0.18, 1500: 0.10, 1800: 0.04, 2000: 0 };
   function eloMove(best, candidates, elo, rand) {
     var list = (candidates || []).filter(function (m) { return !!m; });
     if (!list.length) return best;
+    var alternatives = list.filter(function (m) { return m !== best; });
     var chance = ERROR_RATES[elo] || 0;
     rand = rand || Math.random;
-    if (chance > 0 && rand() < chance) return list[Math.floor(rand() * list.length)] || best;
+    if (alternatives.length && chance > 0 && rand() < chance) {
+      var choice = Math.floor(rand() * alternatives.length);
+      return alternatives[Math.max(0, Math.min(alternatives.length - 1, choice))] || best;
+    }
     return best;
   }
 
@@ -471,10 +502,18 @@
     return (b.depth || 0) > (a.depth || 0) ? b : a;
   }
   function huntPick(list, fen, opt) {
-    var mate = fastestMateLine(list);
+    var extraMates = Array.isArray(opt && opt.mateLines) ? opt.mateLines : [];
+    var mate = fastestMateLine(list.concat(extraMates));
     if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: moveTraits(fen, mate.move), mistake: false };
-    var best = null;
-    list.forEach(function (l) { if (!best || lineValue(l) > lineValue(best)) best = l; });
+    // The pool may combine the level's lines with lines from the deepest iteration. Do not let an optimistic
+    // shallow score define the risk budget for deeper candidates: use the best evaluation at the deepest depth seen.
+    var best = null, bestDepth = -Infinity;
+    list.forEach(function (l) {
+      var depth = l.depth || 0;
+      if (depth > bestDepth || (depth === bestDepth && (!best || lineValue(l) > lineValue(best)))) {
+        best = l; bestDepth = depth;
+      }
+    });
     var floor = lineValue(best) - huntTolerance(opt && opt.huntRisk, lineValue(best));
     var pick = null;
     list.forEach(function (l) {
@@ -491,33 +530,35 @@
   }
 
   /* ---- which move to actually play (auto-play and "what would X play?") ----
-     lines - the engine's candidate lines for the position, best first (already the strength-capped depth)
-     opt   - { elo, mistakes, mateMode, rand, fen, huntRisk }
+     lines - the engine's candidate lines for the position, best first (normally the strength-capped depth)
+     opt   - { elo, mistakes, mateMode, rand, fen, huntRisk, mateLines }
+       mateLines                   : optional positive mate proofs collected from every reported search depth.
+                                     They are used only by mate-seeking styles; they never enter the ELO slip draw.
        mateMode 'shortest' (default): a proven mate outranks everything, and among proven mates the smallest
-                 positive mate score - the fewest moves - is played.
+                 positive mate score - the fewest moves - is played. If no mate is proven, the selected-depth
+                 top line (or a natural slip when enabled) is used.
        mateMode 'normal'            : regular play, the top line of the search, no mate hunting.
-       mateMode 'hunter'            : aggressive. The fewest-move mate is taken first (from the whole pool handed
-                 in, which content.js builds from the level's depth plus the deepest iteration); with no mate, the
-                 most aggressive sound candidate is played - check, bait, then attack on the king - as long as its
-                 evaluation stays within `huntRisk` of the best line. Needs `fen` to see the board; without it
-                 the hunter behaves like 'shortest'.
+       mateMode 'hunter'            : aggressive. The fewest-move mate is taken first (from all mate proofs); with
+                 no mate, the most aggressive sound candidate is played - check, bait, then attack on the king - as
+                 long as its evaluation stays within `huntRisk` of the best line. Needs `fen` to see the board;
+                 without it the hunter behaves like 'shortest'.
        mistakes on                  : the ELO deviation roll may swap the top line for another candidate, which
                                       is what makes 400-1500 look like a person instead of a machine.
-       mistakes off                 : always the best line the engine found at that level.
-     A proven mate is never traded away for a random slip: while mate mode is on, the mistake roll is skipped.
-     A hunter is never overruled by that roll either - it is a deliberate style, not an accident.
-     Returns { uci, line, mate, mistake, hunt } or null when there is nothing legal to play. */
+       mistakes off                 : disables that random deviation; search depth and mate style still apply.
+     A proven mate is never traded away for a random slip. A hunter is never overruled by that roll either - it is a
+     deliberate style, not an accident. Returns { uci, line, mate, mistake, hunt } or null when nothing is legal. */
   function chooseMove(lines, opt) {
     opt = opt || {};
     var list = (lines || []).filter(function (l) { return l && l.move; });
     if (!list.length) return null;
+    var mateLines = list.concat(Array.isArray(opt.mateLines) ? opt.mateLines : []);
     if (opt.mateMode === 'hunter') {
       if (opt.fen) return huntPick(list, opt.fen, opt);
-      var huntMate = fastestMateLine(list);
+      var huntMate = fastestMateLine(mateLines);
       if (huntMate) return { uci: huntMate.move, line: huntMate, mate: huntMate, hunt: null, mistake: false };
     }
     if (opt.mateMode !== 'normal') {
-      var mate = fastestMateLine(list);
+      var mate = fastestMateLine(mateLines);
       if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: null, mistake: false };
     }
     var best = list[0];
