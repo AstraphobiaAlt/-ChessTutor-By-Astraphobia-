@@ -411,13 +411,36 @@
   // what the aggressive pick is worth, in points of pressure: check > bait > attack on the king > capture
   function aggressionScore(t) {
     if (!t) return 0;
-    return (t.check ? 10 : 0) + (t.bait ? 8 : 0) + (t.kingAttack ? 4 : 0) + (t.capture || t.gain ? 2 : 0);
+    return (t.continuation || 0) + (t.check ? 10 : 0) + (t.bait ? 8 : 0) + (t.kingAttack ? 4 : 0) + (t.capture || t.gain ? 2 : 0);
+  }
+  // Trace up to five of our moves in the engine's best-defence continuation.
+  // This rewards sustained pressure, not a promise the opponent will accept a trap.
+  function continuationPressure(fen, line) {
+    if (!fen || !line.pv || line.pv[0] !== line.move) return 0;
+    var parts = fen.split(' '), board = fenBoardMap(fen), us = parts[1] === 'b' ? 'b' : 'w';
+    var ep = parts[3], pressure = 0;
+    for (var i = 0; i < Math.min(10, line.pv.length); i++) {
+      var move = line.pv[i], pc = board[move.slice(0, 2)];
+      var side = i % 2 ? (us === 'w' ? 'b' : 'w') : us;
+      if (!pc || sideOf(pc) !== side) break;
+      var next = applyMove(board, move, ep);
+      if (!next || sideInCheck(next.pieces, side)) break;
+      board = next.pieces;
+      ep = typeOf(pc) === 'P' && Math.abs(+move[1] - +move[3]) === 2
+        ? move[0] + ((+move[1] + +move[3]) / 2) : null;
+      if (i > 0 && i % 2 === 0) {
+        var enemy = us === 'w' ? 'b' : 'w';
+        pressure += (sideInCheck(board, enemy) ? 5 : attacksKingRing(board, us) ? 2 : 0);
+      }
+    }
+    return Math.min(16, pressure);
   }
   // "check + bait (9 pts offered)" - the panel says what the hunter saw, so the move is not a mystery
   function huntNote(t) {
     if (!t) return '';
     var bits = [];
     if (t.check) bits.push('check');
+    if (t.continuation) bits.push('continued pressure vs best defence');
     if (t.bait) bits.push('bait' + (t.loss ? ' (' + t.loss + ' pts offered)' : ''));
     else if (t.capture) bits.push(t.gain ? 'wins material' : 'capture');
     if (t.kingAttack && !t.check) bits.push('attack on the king');
@@ -455,7 +478,9 @@
     var floor = lineValue(best) - huntTolerance(opt && opt.huntRisk, lineValue(best));
     var pick = null;
     list.forEach(function (l) {
-      var t = moveTraits(fen, l.move), score = aggressionScore(t);
+      var t = moveTraits(fen, l.move);
+      if (t) t.continuation = continuationPressure(fen, l);
+      var score = aggressionScore(t);
       if (!score || lineValue(l) < floor) return;               // unsound, or nothing aggressive about it
       if (!pick || score > pick.score || (score === pick.score && lineValue(l) > lineValue(pick.line))) {
         pick = { line: l, traits: t, score: score };
@@ -556,7 +581,7 @@
     reportDepth: reportDepth, chooseMove: chooseMove,
     goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES,
     pieceAttacks: pieceAttacks, attackedBy: attackedBy, sideInCheck: sideInCheck, applyMove: applyMove,
-    hangingValue: hangingValue, moveTraits: moveTraits, aggressionScore: aggressionScore, huntNote: huntNote,
+    continuationPressure: continuationPressure, hangingValue: hangingValue, moveTraits: moveTraits, aggressionScore: aggressionScore, huntNote: huntNote,
     huntPool: huntPool, huntPick: huntPick, huntTolerance: huntTolerance, lineValue: lineValue,
     deeperLine: deeperLine, HUNT_RISK: HUNT_RISK };
   root.CTLib = api;

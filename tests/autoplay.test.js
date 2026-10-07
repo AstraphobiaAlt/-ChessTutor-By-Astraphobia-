@@ -336,5 +336,15 @@ eq(L.chooseMove(deepPool, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very' 
 eq(L.huntPool(levelLines, deepLines, 1).length, 1, 'the pool is capped, so a huge MultiPV list cannot blow it up');
 eq(L.huntPool([], []).length, 0, 'no lines -> no candidates');
 
+
+
+// Sustained best-defence attacks can outrank an isolated check.
+const sustained = { move: 'f3g5', type: 'cp', score: 25, depth: 20,
+  pv: ['f3g5', 'e8d8', 'h1h8', 'd8c7', 'h8h7'] };
+ok(L.continuationPressure(HUNT_FEN, sustained) >= 10, 'two follow-up checks reward sustained pressure');
+eq(hunt([huntLines[0], sustained, huntLines[2]], {}).uci, 'f3g5', 'continued attack outranks the one-off check');
+eq(L.continuationPressure(HUNT_FEN, { move: 'f3g5', pv: ['h1h8'] }), 0, 'mismatched PV is not scored');
+eq(hunt([huntLines[0], Object.assign({}, sustained, { score: -500 })], {}).uci, 'e1e2', 'continuation cannot bypass risk budget');
+
 console.log((failures ? 'FAILED ' : 'OK ') + checks + ' checks, ' + failures + ' failures');
 process.exit(failures ? 1 : 0);

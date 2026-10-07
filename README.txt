@@ -1,6 +1,21 @@
-CHESS TUTOR 1.7
+CHESS TUTOR 1.8
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
+
+UPDATE 1.8
+Reload the unpacked extension at chrome://extensions, approve the new unlimitedStorage permission if
+prompted, then refresh chess.com tabs. Keep the same extension installed: uninstalling deletes its cache.
+The large WASM now lives under the extension origin, not chess.com, with unlimitedStorage to protect it
+from routine quota eviction. Redirects and clearing chess.com data no longer remove that copy. Existing
+site-cache copies are migrated when found. Wait for the first download/save to finish before navigating;
+an interrupted first download or manually deleted extension data can still require another download.
+The small JS loader is still fetched and verified at startup. This is not a fully offline engine.
+
+Hunter now also traces up to five own moves in each candidate's engine PV, rewarding repeated checks and
+king pressure against the engine's best defence. A sustained attacking setup can outrank a single check.
+This is a pressure heuristic, not a trap solver or a guarantee of mate in five. The risk limit still applies,
+forced mates take priority, and the actual board is searched again after each reply (including declined baits).
+For bot games/analysis try Aggressive hunter, Very aggressive, Full engine, and 5–10 seconds think time.
 
 ENGINE
 The tutor runs the strongest Stockfish it can load, in this order:
@@ -21,7 +36,7 @@ tarball (gunzipped and unpacked in the page - it is the only mirror with no per-
 shows the mirror and the percentage while that runs. Every file is checked against the sha256 and size that the
 npm package and the v19.0.0 / v18.0.0 GitHub releases publish, and the engine's own `id name` has to agree, so a
 mirror cannot hand over a lite build or something else and have it run. The verified wasm is then kept in the
-page's Cache Storage: the next visit starts the engine from disk instead of downloading 95 MB again (if that
+extension's Cache Storage: the next visit starts the engine from disk instead of downloading 95 MB again (if that
 cache is missing or was cleared, it simply downloads once more).
 
 The panel's engine line shows what the engine itself reported, e.g. "id name Stockfish 19 WASM by the Stockfish
