@@ -1,0 +1,16 @@
+'use strict';
+const assert = require('node:assert/strict');
+const L = require('../lib.js');
+assert.equal(L.clockMs('5:03'), 303000);
+assert.equal(L.clockMs('0:01.5'), 1500);
+assert.equal(L.clockMs('1:02:03.045'), 3723045);
+for (const text of ['', '5', '5:99', 'Time 3:00', '-1:00', '1:99:00']) assert.equal(L.clockMs(text), null);
+const max = L.maximumLimits(0, null, null);
+assert.equal(max.playDepth, 0);
+assert.equal(max.eager, false);
+assert.equal(L.goCommand(max), 'go movetime 1000');
+assert.equal(L.goCommand(L.maximumLimits(5, 300000, 200000)), 'go wtime 299750 btime 199750 winc 0 binc 0');
+assert.equal(L.goCommand(L.maximumLimits(5, 100, 50)), 'go wtime 1 btime 1 winc 0 binc 0');
+assert.equal(L.goCommand(L.maximumLimits(5, NaN, 50)), 'go movetime 5000');
+assert.equal(L.goCommand(L.maximumLimits(5, 0, 50)), 'go wtime 1 btime 1 winc 0 binc 0');
+console.log('Maximum Strength clock/limit tests passed');

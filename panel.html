@@ -41,6 +41,7 @@
     <div class="ct-field">
       <span class="ct-label" title="Fewest moves: takes the shortest mate the engine proves anywhere in the think-time search; ordinary moves stay at the selected level. Aggressive hunter: takes the shortest proven mate, or prefers a sound attack - checks, newly offered pieces, attacks on the king, and sustained pressure. It can give up up to the selected Hunter risk in evaluation for pressure. No guaranteed traps or mate in five. Regular: it simply plays the best line of the search.">Checkmate style</span>
       <select id="ct-mate" aria-label="Checkmate style">
+        <option value="maximum">Maximum Strength (competitive)</option>
         <option value="shortest">Mate in the fewest moves</option>
         <option value="hunter">Aggressive hunter</option>
         <option value="normal">Regular best move</option>

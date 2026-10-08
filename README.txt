@@ -1,6 +1,16 @@
-CHESS TUTOR 1.8
+CHESS TUTOR 1.9
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
+
+UPDATE 1.9 — MAXIMUM STRENGTH
+Select Checkmate style > Maximum Strength (competitive): full-depth, single-PV search,
+no simulated mistakes, no speculative Hunter concessions, final UCI bestmove selection.
+Readable clocks use Stockfish time management; otherwise Think time (minimum 1 second).
+An optional native Stockfish host adds configurable CPU threads/hash and local Syzygy.
+Startup falls back explicitly to the browser engine if the host is unavailable.
+Reload the extension and approve nativeMessaging, then refresh board tabs.
+Setup, limitations and paired-match testing instructions: native/README.md.
+No instant-mate or unbeatable-strength claim. Bot training/analysis/sanctioned matches only.
 
 UPDATE 1.8
 Reload the unpacked extension at chrome://extensions, approve the new unlimitedStorage permission if

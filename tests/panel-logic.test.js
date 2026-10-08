@@ -55,11 +55,12 @@ function boardHtml() {
 /* A UCI engine that answers from `plan`: it searches `plan.depths` iterations with MultiPV lines, and puts a
    `mate in plan.mateScore` score on line `plan.mateOn` of the deepest iteration only - exactly the shape of a
    real search that only proves the mate late. */
-function makeEngine(win, frameWin, log, plan) {
+function makeEngine(win, frameWin, log, plan, sink) {
   // a real engine answers in a later task, and the tutor registers its UCI waiters after sending, so the fake
   // must never reply synchronously
   const line = l => setTimeout(() => {
-    win.dispatchEvent(new win.MessageEvent('message', { data: { ct: true, line: l }, source: frameWin }));
+    if (sink) sink({ line: l });
+    else win.dispatchEvent(new win.MessageEvent('message', { data: { ct: true, line: l }, source: frameWin }));
   }, 0);
   return {
     mpv: 1,
@@ -132,6 +133,20 @@ async function boot(settings, plan, opts) {
       }
     }
   };
+  if (opts.native) {
+    win.chrome.runtime.connect = () => {
+      let listener, disconnected;
+      const api = makeEngine(win, null, log, planState, d => listener(d));
+      engine.api = api;
+      engine.drop = () => disconnected();
+      return {
+        onMessage: { addListener(fn) { listener = fn; } },
+        onDisconnect: { addListener(fn) { disconnected = fn; } },
+        postMessage(d) { api.handle(d.command); },
+        disconnect() { clearTimeout(api.timer); }
+      };
+    };
+  }
   win.fetch = () => Promise.resolve({ text: () => Promise.resolve(panelHtml) });
   // the page world: the exact FEN on request, and moves only ever go through chess.com's own legal-move list
   const realPost = win.postMessage.bind(win);
@@ -177,8 +192,8 @@ async function boot(settings, plan, opts) {
     return true;
   };
   win.eval(fs.readFileSync(path.join(ROOT, 'content.js'), 'utf8'));
-  if (!await until(() => win.__handshake())) throw new Error('the engine iframe never appeared');
-  if (!await until(() => /confirmed/.test(doc.querySelector('#ct-verify').textContent))) {
+  if (!opts.native && !await until(() => win.__handshake())) throw new Error('the engine iframe never appeared');
+  if (!await until(() => /confirmed|Native backend connected/.test(doc.querySelector('#ct-verify').textContent))) {
     throw new Error('engine never became ready: ' + doc.querySelector('#ct-status').textContent);
   }
   return {
@@ -358,8 +373,8 @@ async function firstPlayedMove(t) {
     const { win, doc } = t;
     eq(doc.querySelector('#ct-mate').value, 'shortest', 'Checkmate style reads back the stored value');
     eq(doc.querySelector('#ct-hunt-riskrow').style.display, 'none', 'the hunter risk dial is hidden for other styles');
-    eq(doc.querySelector('#ct-mate').options.length, 3, 'the panel offers all three checkmate styles');
-    eq(doc.querySelector('#ct-mate').options[1].value, 'hunter', 'the aggressive hunter is the new option');
+    eq(doc.querySelector('#ct-mate').options.length, 4, 'the panel offers four modes');
+    eq(doc.querySelector('#ct-mate').options[2].value, 'hunter', 'the aggressive hunter is the new option');
     const goBefore = t.goCount();
     setSelect(win, doc.querySelector('#ct-mate'), 'hunter');
     eq(doc.querySelector('#ct-hunt-riskrow').style.display, '', 'choosing the hunter reveals its risk dial');
@@ -433,6 +448,39 @@ async function firstPlayedMove(t) {
       'regular mode goes back to the top line of the search: ' + doc.querySelector('#ct-elotxt').textContent);
     ok(!/mate in/.test(doc.querySelector('#ct-elotxt').textContent), 'and does not mention the mate');
     ok(/regular best move/.test(doc.querySelector('#ct-tip').textContent), 'the tip reflects the mode');
+    win.close();
+  }
+
+  // Maximum mode overrides stored handicaps, reports native fallback, and never does instant search.
+  {
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 0, auto: false, autoplay: false,
+      mateMode: 'maximum', mistakes: true, open: true }, { depths: 4 });
+    const { win, doc, log } = t;
+    eq(doc.querySelector('#ct-mate').value, 'maximum', 'maximum mode persists');
+    ok(doc.querySelector('#ct-mistakes').disabled, 'mistake control disabled');
+    ok(doc.querySelector('#ct-level').disabled, 'ELO control disabled');
+    click(win, doc.querySelector('#ct-analyze'));
+    ok(await until(() => /Thought/.test(t.status())), 'maximum search completed');
+    eq(t.lastGo(), 'go movetime 1000', 'zero think time gets a real minimum search');
+    ok(/Native unavailable/.test(doc.querySelector('#ct-engdetail').textContent), 'native fallback is explicit');
+    ok(/Maximum Strength/.test(doc.querySelector('#ct-tip').textContent), 'maximum policy is visible');
+    win.close();
+  }
+
+  {
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: false,
+      mateMode: 'maximum', mistakes: true, open: true }, { depths: 8 }, { native: true });
+    const { win, doc, log } = t;
+    click(win, doc.querySelector('#ct-analyze'));
+    ok(await until(() => /Thought/.test(t.status())), 'native search completes');
+    eq(t.lastGo(), 'go movetime 2000', 'native gets requested analysis time');
+    ok(log.cmds.includes('setoption name MultiPV value 1'), 'maximum uses single PV');
+    ok(/depth 8/.test(t.status()), 'maximum ignores stored 400 ELO cap: ' + t.status());
+    ok(/Native backend connected/.test(doc.querySelector('#ct-verify').textContent), 'native connection visible');
+    eq(doc.querySelectorAll('iframe').length, 0, 'native mode never downloads a browser engine');
+    t.engine.drop();
+    ok(/disconnected/.test(t.status()), 'native disconnect is visible');
+    eq(doc.querySelectorAll('svg.ct-overlay g').length, 0, 'native disconnect clears stale arrows');
     win.close();
   }
 
