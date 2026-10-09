@@ -2,6 +2,7 @@
 """Chrome Native Messaging <-> persistent Stockfish UCI. Stdlib only."""
 import json
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -40,17 +41,40 @@ def validate_config(config):
     syzygy = config.get('syzygy_path', '')
     if not isinstance(syzygy, str) or '\n' in syzygy or '\r' in syzygy:
         raise ValueError('Invalid Syzygy path')
+    # Pondering searches on the opponent's time and therefore uses CPU while it is not our move. It is a match
+    # rule (allowed or not), so it stays off unless the person who installed the host explicitly enabled it.
+    ponder = config.get('ponder', False)
+    if type(ponder) is not bool:
+        raise ValueError('Invalid ponder flag (true/false)')
+    config['ponder'] = ponder
     return config
 
 
-def allowed_command(command):
+_FEN = r'[1-8pnbrqkPNBRQK/]{15,92} [wb] (?:-|[KQkq]{1,4}) (?:-|[a-h][36]) \d{1,4} \d{1,5}'
+_POSITION = re.compile(r'position (?:startpos|fen ' + _FEN + r')(?: moves(?: [a-h][1-8][a-h][1-8][qrbn]?)+)?')
+_GO = re.compile(r'go(?P<ponder> ponder)?(?: (?:wtime|btime|winc|binc|movestogo|depth|nodes|movetime|mate) \d{1,10}| infinite)*')
+_SETOPTION = re.compile(r'setoption name (?:MultiPV value (?:[1-9]|[1-9]\d|[1-4]\d\d|500)'
+                        r'|UCI_LimitStrength value false|Skill Level value 20'
+                        r'|Move Overhead value (?:\d{1,3}|[1-4]\d{3}|5000)|Ponder value (?P<ponder>true|false))')
+
+
+def allowed_command(command, ponder_allowed=False):
+    """Allow only the UCI commands the extension needs, in their exact grammar."""
     if not isinstance(command, str) or len(command) > 16384 or '\n' in command or '\r' in command:
         return False
-    return (command in ('uci', 'isready', 'stop', 'ucinewgame', 'quit')
-            or command.startswith(('position ', 'go ', 'setoption name MultiPV value ',
-                                   'setoption name UCI_LimitStrength value false',
-                                   'setoption name Skill Level value 20',
-                                   'setoption name Move Overhead value 150')))
+    if command in ('uci', 'isready', 'stop', 'ucinewgame', 'quit'):
+        return True
+    if command == 'ponderhit':
+        return ponder_allowed
+    if _POSITION.fullmatch(command):
+        return True
+    match = _GO.fullmatch(command)
+    if match:
+        return ponder_allowed or not match.group('ponder')
+    match = _SETOPTION.fullmatch(command)
+    if match:
+        return ponder_allowed or match.group('ponder') != 'true'
+    return False
 
 
 def main():
@@ -85,9 +109,12 @@ def main():
                         syzygy = config.get('syzygy_path', '')
                         if syzygy:
                             send('setoption name SyzygyPath value ' + syzygy)
-                        emit({'line': 'info string CT Threads %d · Hash %d MB · Syzygy %s' % (
+                        emit({'line': 'info string CT Threads %d · Hash %d MB · Syzygy %s · Ponder %s' % (
                             config['threads'], config['hash_mb'],
-                            'path configured (coverage depends on installed files)' if syzygy else 'not configured')})
+                            'path configured (coverage depends on installed files)' if syzygy else 'not configured',
+                            'allowed by host config' if config['ponder'] else 'disabled by host config')})
+                        # Machine-readable capability line; the extension only ponders when this says so.
+                        emit({'line': 'info string CT-CAPS ponder=%d' % int(config['ponder'])})
                     emit({'line': line})
                 emit({'error': 'Stockfish exited'})
             except (BrokenPipeError, OSError):
@@ -97,7 +124,7 @@ def main():
         while True:
             message = read_message(sys.stdin.buffer)
             command = message.get('command')
-            if not allowed_command(command):
+            if not allowed_command(command, config['ponder']):
                 raise ValueError('Unsupported UCI command')
             send(command)
             if command == 'quit':

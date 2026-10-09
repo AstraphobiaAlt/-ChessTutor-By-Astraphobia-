@@ -1,6 +1,24 @@
-CHESS TUTOR 1.9
+CHESS TUTOR 1.10
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
+
+UPDATE 1.10 — GAME CONTEXT: MOVE HISTORY, REAL CLOCKS, PONDERING
+Move history: every search (all styles, browser and native engine) now gets the start position plus every
+move ("position startpos moves ..."), not just a FEN, so Stockfish sees repetitions: it takes a threefold
+draw when losing and avoids one when winning. The tutor follows the game move by move (each new board must be
+one or two LEGAL moves from the last, otherwise it is a takeback or a new game). Joined mid-game, it uses the
+board's own move list only if replaying it reaches exactly the current position; otherwise it sends the FEN
+and the panel says "repetitions before the first seen position unknown". The panel's History line shows
+what the engine was told.
+Clocks (Maximum Strength + auto-play): both remaining times, whose clock is running, and the increment (game
+TimeControl / time-control label, cross-checked against observed clock jumps) go to Stockfish's time
+manager. A safety reserve (measured move-submission latency + clock display resolution) is held back.
+Uncertain clock data falls back explicitly to Think time, with the reason shown. An unknown increment is
+treated as 0 and labelled.
+Pondering (opt-in): "Ponder on opponent's time" lets native Stockfish search the predicted reply while the
+opponent thinks, then continue with ponderhit, or stop and discard if another move is played. It needs
+Maximum Strength, auto-play, a complete history, certain clocks, and a native host installed with
+--allow-ponder. Use it only where the match rules allow pondering. Details: native/README.md.
 
 UPDATE 1.9 — MAXIMUM STRENGTH
 Select Checkmate style > Maximum Strength (competitive): full-depth, single-PV search,
@@ -180,5 +198,8 @@ closed. Bot games, analysis boards, and playing both sides yourself are what thi
       tarball and the engine cache are unit-tested: node tests/engine-frame.test.js
 (dev) the engine cache surviving a redirect (one copy per origin, path-keyed duplicates pruned, the two-step
       cache answer) is integration-tested: node tests/panel-logic.test.js
+(dev) legal moves (perft), the move-history tracker, position commands, the clock adapter and the ponder gate
+      are unit-tested: node tests/game.test.js
 (dev) the panel wiring end to end (jsdom + fake UCI engine) is tested: node tests/panel-logic.test.js
+      with CT_STOCKFISH=/path/to/stockfish it also plays ponder/ponderhit/cancel against a real engine
       it needs jsdom once - npm install --no-save jsdom - and skips itself when jsdom is missing

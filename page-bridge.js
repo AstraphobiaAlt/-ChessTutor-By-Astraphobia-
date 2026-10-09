@@ -43,6 +43,45 @@
     }
   }
 
+  /* Best-effort game context for the content script: the board's own move list and its PGN headers (start FEN,
+     TimeControl). Board builds differ, so several getter names are tried and every result is plain data. None of
+     it is trusted here: the content script replays the move list with its own legal-move generator and uses it
+     only when it reaches exactly the position on the board (game.js historyFromMoves). */
+  var plain = function (m) {
+    if (typeof m === 'string') return m.slice(0, 16);
+    if (!m || typeof m !== 'object') return null;
+    var o = {};
+    ['from', 'to', 'promotion', 'san'].forEach(function (k) { if (typeof m[k] === 'string') o[k] = m[k].slice(0, 16); });
+    return o.san || (o.from && o.to) ? o : null;
+  };
+  function readHistory(g) {
+    var names = ['getHistorySANs', 'getHistory', 'getMoveList'];
+    for (var i = 0; i < names.length; i++) {
+      try {
+        if (typeof g[names[i]] !== 'function') continue;
+        var list = g[names[i]]();
+        if (!Array.isArray(list) || list.length > 2000) continue;
+        var out = list.map(plain);
+        if (out.every(Boolean)) return { via: names[i], moves: out };
+      } catch (_) {}
+    }
+    return null;
+  }
+  function readHeaders(g) {
+    var h = null, out = {};
+    try { if (typeof g.getHeaders === 'function') h = g.getHeaders(); } catch (_) {}
+    if ((!h || typeof h !== 'object') && typeof g.getPGN === 'function') {
+      try {
+        var pgn = String(g.getPGN() || '');
+        h = {};
+        pgn.replace(/\[(\w+) "([^"]*)"\]/g, function (_, k, v) { h[k] = v; return ''; });
+      } catch (_) { h = null; }
+    }
+    if (!h || typeof h !== 'object') return null;
+    ['FEN', 'SetUp', 'TimeControl', 'Variant'].forEach(function (k) { if (typeof h[k] === 'string') out[k] = h[k].slice(0, 120); });
+    return out;
+  }
+
   window.addEventListener('message', function (e) {
     if (e.source !== window || !e.data) return;
     if (e.data.ctReq === 1) {
@@ -52,6 +91,7 @@
         if (g && typeof g.getFEN === 'function') {
           var f = g.getFEN();
           if (typeof f === 'string' && f.split(' ').length >= 4) { out.fen = f; out.ok = true; }
+          if (out.ok && e.data.context) { out.history = readHistory(g); out.headers = readHeaders(g); }
         }
       } catch (_) {}
       reply(out);
