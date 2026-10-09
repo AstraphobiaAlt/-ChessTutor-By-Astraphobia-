@@ -95,7 +95,7 @@
     S.hash = [16, 32, 64, 128, 256].includes(S.hash) ? S.hash : 128;
     S.opacity = clamp(S.opacity, 35, 100, 100);
     S.autoplay = !!S.autoplay;
-    S.mateMode = ['normal', 'shortest', 'hunter'].includes(S.mateMode) ? S.mateMode : 'shortest';
+    S.mateMode = ['normal', 'shortest', 'hunter', 'maximum'].includes(S.mateMode) ? S.mateMode : 'shortest';
     S.huntRisk = ['sound', 'balanced', 'very'].includes(S.huntRisk) ? S.huntRisk : 'very';
     S.mistakes = S.mistakes !== false;                               // mistakes stay on unless explicitly turned off
     if (!['me', 'turn', 'w', 'b'].includes(S.side)) S.side = 'me';
@@ -194,12 +194,21 @@
   const keyOf = p => p.fen.split(' ').slice(0, 4).join(' ') + '|' + p.mover + S.side;
 
   // ---------- Search limits ----------
+  const maximumOn = () => S.mateMode === 'maximum';
   const eloKey = () => PRESETS[S.elo] !== undefined ? S.elo : 1200;
   const autoplayEloKey = () => PRESETS[S.autoplayElo] !== undefined ? S.autoplayElo : 3200;
   // The ELO level is the strength target, Think time is the clock. They are separate on purpose: the engine is
   // allowed to keep searching for the whole think time even at 400 ELO, and the move it answers/plays is then
   // taken from that level's depth. Auto-play dispatches as soon as that search returns - no extra pacing timer.
   function limits() {
+    if (maximumOn()) {
+      // Only use unambiguous colour-labelled clocks. Unknown increment is conservatively zero.
+      const clocks = ['white', 'black'].map(c => {
+        const nodes = S.autoplay ? document.querySelectorAll('.clock-' + c + ' .clock-time') : [];
+        return nodes.length === 1 ? L.clockMs(nodes[0].textContent) : null;
+      });
+      return L.maximumLimits(S.time, clocks[0], clocks[1]);
+    }
     const depth = S.autoplay
       ? PRESETS[autoplayEloKey()]
       : (S.custom ? (S.depth >= DEPTH_INF ? 0 : S.depth) : PRESETS[eloKey()]);
@@ -347,6 +356,17 @@
         this.waiters.push(w);
       });
     }
+    dispose() {
+      if (this.disposed) return;
+      this.disposed = true;
+      this.waiters.splice(0).forEach(w => { clearTimeout(w.t); w.res(null); });
+      this.ready = false;
+      if (this.cur) { this.cur.superseded = true; this.settle(this.cur); }
+      if (this.queued) this.queued.resolve(null);
+      this.cur = this.queued = null;
+      if (this.port) this.port.disconnect();
+      if (this.frame) { this.send('stop'); this.frame.remove(); }
+    }
     send(c) {
       this.frame.contentWindow.postMessage({ ctCmd: c }, '*');
     }
@@ -360,7 +380,8 @@
         return;
       }
       if (!l.startsWith('bestmove')) return;
-      const cur = this.cur; this.cur = null; this.busy = false;
+      const cur = this.cur; if (cur) cur.bestmove = l.split(/\s+/)[1];
+      this.cur = null; this.busy = false;
       this.settle(cur);
       if (this.queued) { const q = this.queued; this.queued = null; this.run(q); }
     }
@@ -378,6 +399,12 @@
       const deepest = ds.length ? this.byDepth[Math.max(...ds)] : {};
       // the deepest iteration the think time reached, as candidate lines too. The hunter uses these for pressure
       // picks that a low ELO's own depth never saw.
+      if (cur.lim && cur.lim.maximum && cur.bestmove) {
+        // UCI bestmove is authoritative, not a previous iteration's tempting mate.
+        const candidates = ds.sort((a, b) => b - a).flatMap(d => Object.values(this.byDepth[d]));
+        const finalLine = candidates.find(l => l.move === cur.bestmove);
+        lines.splice(0, lines.length, ...(finalLine ? [finalLine] : []));
+      }
       const deepLines = Object.keys(deepest).map(Number).sort((x, y) => x - y).map(k => deepest[k]);
       // Keep every positive mate proof reported during this search, not just the selected ELO depth or the final
       // (possibly half-filled) MultiPV depth. Shortest-mate styles can then take advantage of the whole think-time
@@ -423,6 +450,46 @@
       this.send('position fen ' + job.fen);
       this.send(L.goCommand(job.lim));
     }
+  }
+
+  class NativeEngine extends Engine {
+    async init() {
+      this.port = chrome.runtime.connect({ name: 'ct-native' });
+      this.meta = { engineKind: 'Native UCI', engineName: 'Stockfish', options: [] };
+      const fail = error => {
+        if (this.disposed) return;
+        this.failure = error; this.dispose();
+        if (engine === this) {
+          engine = null; lastResult = null; lastEloMove = null; analysisSeq++; render();
+          el.verify.className = 'warn'; el.verify.textContent = 'Native backend disconnected';
+          setStatus('Native engine disconnected: ' + error + '. Press Analyze to retry.');
+        }
+      };
+      this.port.onDisconnect.addListener(() => fail('Native Messaging connection closed'));
+      this.port.onMessage.addListener(d => {
+        if (d.error) { fail(d.error); return; }
+        if (d.line) {
+          if (d.line.startsWith('id name ')) this.meta.idName = d.line.slice(8);
+          if (d.line.startsWith('option ')) { const o = L.parseOption(d.line); if (o) this.opts[o.name] = o; }
+          if (d.line.startsWith('info string CT ')) this.nativeDetail = d.line.slice(15);
+          this.onLine(d.line);
+        }
+      });
+      const hello = this.waitLine(l => l === 'uciok', 5000);
+      this.send('uci');
+      if (!await hello || this.failure) throw new Error(this.failure || 'native host did not answer');
+      if (!/stockfish/i.test(this.meta.idName || '')) throw new Error('native host must run Stockfish');
+      // The host owns hardware/tablebase configuration; do not override it with browser settings.
+      this.send('setoption name UCI_LimitStrength value false');
+      this.send('setoption name Skill Level value 20');
+      this.send('setoption name Move Overhead value 150');
+      const ready = this.waitLine(l => l === 'readyok', 5000);
+      this.send('isready');
+      if (!await ready || this.failure) throw new Error(this.failure || 'native engine not ready');
+      this.ready = true;
+    }
+    send(c) { if (this.port) this.port.postMessage({ command: c }); }
+    setHash() {} // Native settings live in native/config.json.
   }
 
   // ---------- SVG overlay ----------
@@ -486,6 +553,13 @@
   // ---------- UI helpers ----------
   const setStatus = t => { if (el.status) el.status.textContent = t; };
   function showEngine() {
+    if (engine instanceof NativeEngine && engine.ready) {
+      el.engine.textContent = engine.meta.idName;
+      el.verify.className = 'ok';
+      el.verify.textContent = 'Native backend connected (identity reported by engine, binary not verified)';
+      el.engdetail.textContent = engine.nativeDetail || 'Native Stockfish · hardware and Syzygy configured in native/config.json';
+      return;
+    }
     if (!el.engine || !engine || !engine.meta) return;
     const m = engine.meta, id = m.idName || 'unknown engine';
     const name = m.engineName || 'engine';
@@ -515,9 +589,15 @@
     if (engine.cacheError) bits.push('not cached: ' + engine.cacheError);
     if (engine.selfTest) bits.push(engine.selfTest.ok ? 'self-test OK' + (engine.selfTest.nps ? ' @ ' + Math.round(engine.selfTest.nps / 1000) + ' kn/s' : '') : 'self-test FAILED');
     if (m.hash) bits.push('sha256 ' + m.hash.slice(0, 12));
+    if (engine.nativeFallback) bits.push('Native unavailable: ' + engine.nativeFallback + ' — browser fallback, no local Syzygy');
     el.engdetail.textContent = bits.filter(Boolean).join(' \u00B7 ');
   }
   function updateTip() {
+    if (maximumOn()) {
+      el.tip.textContent = 'Maximum Strength: uncapped search, one principal variation, no mistakes or speculative sacrifices. Uses readable clocks (unknown increment = 0); otherwise Think time, minimum 1s. Forced mates only—not guaranteed instant mate. Native backend is optional; see native/README.md.';
+      el.eloBtn.textContent = 'Show maximum-strength move';
+      return;
+    }
     const think = S.time > 0 ? 'It thinks for ' + fmtSecs(S.time) + ' per position at every level' : 'It answers instantly (first complete result)';
     const policy = (S.mateMode === 'shortest' ? 'fewest-move mate'
       : S.mateMode === 'hunter' ? 'aggressive hunter (' + huntLabel() + ')' : 'regular best move') + ', ' +
@@ -528,6 +608,11 @@
     el.eloBtn.textContent = S.custom ? 'What would 1200 play?' : 'What would ' + levelLabel() + ' play?';
   }
   function updateAutoHint() {
+    if (maximumOn()) {
+      el.autohint.textContent = 'Maximum Strength · ' + (S.autoplay ? 'auto-play on' : 'auto-play off') + '. Full-depth engine best move; clock-aware when both clocks are readable. Training/bot matches only. Pondering is available in the local match harness, not on web boards.';
+      el.autohint.classList.toggle('on', S.autoplay);
+      return;
+    }
     const who = S.side === 'me' ? 'your side' : S.side === 'turn' ? 'the side to move, both colours' : S.side === 'w' ? 'White' : 'Black';
     const at = autoplayEloKey() >= 3200 ? 'Full engine' : autoplayLevelLabel() + ' ELO';
     const timing = S.time > 0
@@ -549,9 +634,10 @@
   // "Move dispatch" is a readout, not a control: auto-play has no pacing timer of its own, the only wait before
   // a move goes out is the Think time the engine is given for that position.
   function syncDispatch() {
-    if (el.response) el.response.textContent = S.time > 0 ? 'After ' + fmtSecs(S.time) + ' thinking' : 'Immediate (instant)';
+    if (el.response) el.response.textContent = maximumOn() ? 'Engine clock budget / Think time fallback' : S.time > 0 ? 'After ' + fmtSecs(S.time) + ' thinking' : 'Immediate (instant)';
   }
   function syncControls() {
+    [el.level, el.depth, el.autoplayElo, el.mistakes].forEach(n => { n.disabled = maximumOn(); });
     el.level.value = S.custom ? 'custom' : String(eloKey());
     el.depthRow.style.display = S.custom ? '' : 'none';
     el.depth.value = S.depth; el.depthVal.textContent = S.depth >= DEPTH_INF ? '\u221E' : String(S.depth);
@@ -591,7 +677,7 @@
     }
     if (!engine.ready) { setStatus('Engine loading...'); return; }
     const lim = limits(), t0 = Date.now();
-    const strength = S.autoplay ? 'auto-play ' + autoplayLevelLabel() + ' ELO' : levelLabel() + ' ELO';
+    const strength = maximumOn() ? 'Maximum Strength' : S.autoplay ? 'auto-play ' + autoplayLevelLabel() + ' ELO' : levelLabel() + ' ELO';
     const goal = S.mateMode === 'shortest' ? ', preferring the shortest proven mate'
       : S.mateMode === 'hunter' ? ', hunting mate / check / bait (' + huntLabel() + ')' : ', regular best move';
     setStatus((S.time > 0 ? 'Thinking for ' + fmtSecs(S.time) + ' (' + strength + goal + ')...' : 'Searching (' + strength + goal + ')...'));
@@ -603,7 +689,7 @@
     if (seq !== analysisSeq) return;
     const now = await readPosition();
     if (!now || now.settling || keyOf(now) !== keyOf(pos)) return;   // board changed while thinking; poll restarts
-    if (!r.lines.length) { setStatus('No legal moves (game over?).'); return; }
+    if (!r.lines.length) { setStatus(maximumOn() ? 'No usable final engine line (game over or insufficient search output). No move played.' : 'No legal moves (game over?).'); return; }
     const pool = huntPoolFor(r);                              // hunter: level depth + deepest iteration
     // In hunter mode the headline move and arrow 1 ARE the hunter's choice, so what the panel shows is what the
     // style would actually play; the engine's remaining candidates follow it. The other styles show the search.
@@ -672,11 +758,11 @@
   // natural deviations or shrink mate coverage to one PV. The hunter asks for more because checks/baits can rank
   // well below the quiet top lines; MultiPV splits the same think time, which is the cost of that style.
   const MPV_HUNTER = 12, MPV_AUTOPLAY = 5, MPV_STANDARD = 3;
-  const mpvFor = () => huntOn() ? MPV_HUNTER : (S.autoplay ? MPV_AUTOPLAY : MPV_STANDARD);
+  const mpvFor = () => maximumOn() ? 1 : huntOn() ? MPV_HUNTER : (S.autoplay ? MPV_AUTOPLAY : MPV_STANDARD);
   // For non-mate pressure the hunter looks at its level's depth AND the deepest iteration. All mate-seeking styles
   // also receive the engine's positive mate proofs from every completed depth; ordinary moves remain level-capped.
   const huntPoolFor = r => huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
-  const pickOpts = (fen, elo, mateLines) => ({ elo: elo, mistakes: S.mistakes, mateMode: S.mateMode,
+  const pickOpts = (fen, elo, mateLines) => ({ elo: maximumOn() ? 3200 : elo, mistakes: maximumOn() ? false : S.mistakes, mateMode: maximumOn() ? 'normal' : S.mateMode,
     huntRisk: S.huntRisk, fen: fen, rand: Math.random, mateLines: mateLines || [] });
   const huntLabel = () => (S.huntRisk === 'sound' ? 'sound' : S.huntRisk === 'balanced' ? 'balanced' : 'very aggressive');
 
@@ -770,7 +856,7 @@
     const base = lastResult;
     let lines = base.choiceLines || base.lines;
     let mateLines = base.mateLines || [];
-    if (lines.length < 3 && engine && engine.ready) {
+    if (!maximumOn() && lines.length < 3 && engine && engine.ready) {
       const r = await engine.analyze(base.fen, limits(), mpvFor());
       if (!lastResult || lastResult.fen !== base.fen) return;
       if (r && r.lines.length) {
@@ -1008,8 +1094,14 @@
     el.time.addEventListener('input', () => { S.time = +el.time.value; el.timeVal.textContent = fmtSecs(S.time); updateTip(); updateAutoHint(); syncDispatch(); });
     el.time.addEventListener('change', () => { saveSettings(); syncDispatch(); rerunSoon(); });
     el.mate.addEventListener('change', () => {
-      S.mateMode = ['normal', 'shortest', 'hunter'].includes(el.mate.value) ? el.mate.value : 'shortest';
-      saveSettings(); syncControls(); rerun();
+      const wasMaximum = maximumOn();
+      S.mateMode = ['normal', 'shortest', 'hunter', 'maximum'].includes(el.mate.value) ? el.mate.value : 'shortest';
+      saveSettings(); syncControls();
+      if (wasMaximum !== maximumOn() && !starting) {
+        analysisSeq++; lastResult = null; lastEloMove = null; render();
+        if (engine) engine.dispose();
+        engine = null; startEngine();
+      } else rerun();
     });
     el.huntRisk.addEventListener('change', () => {
       S.huntRisk = ['sound', 'balanced', 'very'].includes(el.huntRisk.value) ? el.huntRisk.value : 'very';
@@ -1109,22 +1201,35 @@
   async function startEngine() {
     if (engine || starting) return;
     starting = true;
-    const e = new Engine();
+    const requestedMaximum = maximumOn();
+    let e = new Engine();
     try {
+      if (maximumOn()) {
+        const native = new NativeEngine();
+        setStatus('Connecting optional native Stockfish backend...');
+        try { await native.init(); e = native; }
+        catch (err) { native.dispose(); e.nativeFallback = err.message; }
+      }
       setStatus('Loading engine...');
       el.verify.className = 'warn'; el.verify.textContent = 'Checking engine...';
       engine = e;
       // ask for persistent storage once the panel is up, so Chrome keeps the engine instead of evicting it
       askPersistentStorage().then(p => { if (e.cachePersisted !== true) e.cachePersisted = p; showEngine(); }).catch(() => {});
-      await e.init();
-      showEngine(); setStatus('Ready');
+      if (!e.ready) await e.init();
+      showEngine(); setStatus(e.nativeFallback ? 'Browser fallback: ' + e.nativeFallback : 'Ready');
       if (S.auto || S.autoplay) analyze();
     } catch (err) {
       engine = null;
       el.verify.className = 'warn'; el.verify.textContent = '\u26A0 Engine failed to start';
       setStatus('Engine failed to start: ' + err.message + ' (press Analyze to retry)');
       try { e.frame && e.frame.remove(); } catch (_) {}
-    } finally { starting = false; }
+    } finally {
+      starting = false;
+      if (requestedMaximum !== maximumOn()) {
+        if (engine) engine.dispose();
+        engine = null; startEngine();
+      }
+    }
   }
 
   async function boot() {

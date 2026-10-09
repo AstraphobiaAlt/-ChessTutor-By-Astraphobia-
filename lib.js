@@ -389,7 +389,21 @@
     var full = within.filter(function (d) { return Object.keys(byDepth[d]).length === maxN; });
     return full[full.length - 1];                     // deepest complete one at or below the cap
   }
+  function clockMs(text) {
+    var m = String(text).trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?$/);
+    if (!m || +m[3] >= 60 || (m[1] && +m[2] >= 60)) return null;
+    return ((+(m[1] || 0) * 3600 + +m[2] * 60 + +m[3]) * 1000) + +(m[4] || '').padEnd(3, '0');
+  }
+  function maximumLimits(time, white, black) {
+    var lim = { maximum: true, depth: 0, playDepth: 0, eager: false, timeMs: Math.max(1000, Math.round((time || 0) * 1000)) };
+    if ([white, black].every(function(n) { return Number.isFinite(n) && n >= 0; })) {
+      lim.clocks = { white: Math.max(1, white - 250), black: Math.max(1, black - 250) };
+      lim.timeMs = 0;
+    }
+    return lim;
+  }
   function goCommand(lim) {
+    if (lim.clocks) return 'go wtime ' + Math.round(lim.clocks.white) + ' btime ' + Math.round(lim.clocks.black) + ' winc 0 binc 0';
     return 'go' + (lim.depth ? ' depth ' + lim.depth : '') + (lim.timeMs ? ' movetime ' + lim.timeMs : '');
   }
 
@@ -620,7 +634,7 @@
     arrowShape: arrowShape, fmtCount: fmtCount, panelGeom: panelGeom,
     bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, fastestMateLine: fastestMateLine, searchLimits: searchLimits,
     reportDepth: reportDepth, chooseMove: chooseMove,
-    goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES,
+    clockMs: clockMs, maximumLimits: maximumLimits, goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES,
     pieceAttacks: pieceAttacks, attackedBy: attackedBy, sideInCheck: sideInCheck, applyMove: applyMove,
     continuationPressure: continuationPressure, hangingValue: hangingValue, moveTraits: moveTraits, aggressionScore: aggressionScore, huntNote: huntNote,
     huntPool: huntPool, huntPick: huntPick, huntTolerance: huntTolerance, lineValue: lineValue,

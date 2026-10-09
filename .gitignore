@@ -1,1 +1,9 @@
 node_modules/
+__pycache__/
+*.pyc
+native/config.json
+native/launch.sh
+native/launch.bat
+native/ai.chess_tutor.stockfish.json
+native/results/
+.venv/
