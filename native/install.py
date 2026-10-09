@@ -12,13 +12,16 @@ p.add_argument('--engine', required=True, type=pathlib.Path)
 p.add_argument('--threads', type=int, default=2)
 p.add_argument('--hash-mb', type=int, default=256)
 p.add_argument('--syzygy-path', default='')
+p.add_argument('--allow-ponder', action='store_true',
+               help='Allow the extension to ponder (search on the opponent\'s time). Only where match rules allow it.')
 a = p.parse_args()
 if not re.fullmatch('[a-p]{32}', a.extension_id):
     p.error('Copy the 32-character extension ID from chrome://extensions')
 from host import validate_config
 root = pathlib.Path(__file__).resolve().parent
 config = validate_config(dict(engine=str(a.engine.resolve()), threads=a.threads,
-                              hash_mb=a.hash_mb, syzygy_path=a.syzygy_path))
+                              hash_mb=a.hash_mb, syzygy_path=a.syzygy_path,
+                              ponder=a.allow_ponder))
 (root / 'config.json').write_text(json.dumps(config, indent=2))
 if sys.platform == 'win32':
     launcher = root / 'launch.bat'

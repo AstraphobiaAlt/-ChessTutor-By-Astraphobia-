@@ -1,6 +1,6 @@
 # Maximum Strength — optional native backend
 
-Select **Checkmate style → Maximum Strength (competitive)** in Chess Tutor 1.9.
+Select **Checkmate style → Maximum Strength (competitive)** in Chess Tutor 1.10.
 Reload the extension after updating, approve the new `nativeMessaging` permission,
 then refresh the board tab. Existing modes and saved ELO settings are retained.
 
@@ -11,11 +11,11 @@ then refresh the board tab. Existing modes and saved ELO settings are retained.
 - Lets Stockfish prioritize sound attacks and forced mates. No forced/instant mate
   is promised in positions where it does not exist; no strength gain is claimed
   without measured matches.
-- During auto-play, when both colour-labelled web clocks are readable, passes remaining time to
-  Stockfish's own adaptive time manager, reserving 250 ms per clock. Web increments
-  are unknown and conservatively treated as zero. Stockfish handles search
-  instability and forced replies internally. Otherwise uses Think time, with a
-  one-second minimum (the ordinary modes still support instant answers).
+- Sends the **start position plus every move** (`position startpos moves …`), so
+  Stockfish sees repetition history (see *Move history* below).
+- During auto-play, the **clock adapter** gives Stockfish's own time manager
+  `wtime/btime/winc/binc` (see *Clocks* below). If the clock data is uncertain,
+  it falls back to Think time (one-second minimum) and shows why.
 - Attempts the native host first. If unavailable at startup, uses the existing
   browser engine and explicitly labels the fallback in Engine details. It does
   **not** pretend the fallback is multi-core or tablebase-enabled.
@@ -64,10 +64,85 @@ sets `Syzygy50MoveRule=true`. Exact coverage requires the relevant files and a
 supported position. A configured path is **not** evidence of a tablebase hit.
 No tablebases are shipped; large tablebase sets should not be committed to Git.
 
-Web analysis currently sends a FEN, not the complete game history. FEN preserves
-the halfmove clock but cannot encode repetition history. Missing board API FENs
-may use the existing DOM-derived fallback. For rigorous match results use the
-harness below, which supplies complete legal move histories.
+## Move history
+
+A FEN describes one position, not how the game got there. The extension now
+rebuilds the game's move list and sends `position startpos moves …` for every
+search (all modes, browser and native engines):
+
+- Each stable board reading must be one legal move (or two, for an instant
+  premove reply) from the previous one. A repeated position is still a legal move,
+  so repetitions are recorded. A return to an earlier position that is *not* one
+  move away truncates the history (takeback / analysis navigation). Anything
+  else starts a new history (new game).
+- The history is **complete** when it starts at the initial position, or when its
+  oldest position lies at or before the last irreversible move (halfmove clock).
+  No earlier position can recur, which is also as far back as Stockfish looks.
+- Joined mid-game, the board's own move list (if the page exposes one) is replayed
+  with the extension's legal-move generator and used **only** if it reaches exactly
+  the current position. Otherwise the FEN is sent and the panel says repetitions
+  before the first seen position are unknown.
+- The command is shortened (losslessly, to the last irreversible move) only if it
+  would exceed the 16 KB transport limit.
+- Standard chess only: Chess960 castling is not generated, so such games fall back
+  to FEN (honestly labelled).
+
+Proof against a real engine (`tests/native_test.py`, with `CT_STOCKFISH` set): in a
+queen-down position where the losing side can repeat for the third time,
+FEN-only Stockfish scores it as lost; with the move history it plays the
+repeating move and scores it 0.00.
+
+## Clocks
+
+During Maximum Strength auto-play the clock adapter reads:
+
+- **Both remaining times.** Exactly one white and one black clock, each with one
+  readable time. Its display resolution (whole seconds, or tenths under 20 s) is
+  part of the reserve.
+- **The running side.** The page's active-clock marker, or failing that, the one
+  clock seen ticking in the current position. It must match the side to move.
+- **The increment.** From the game's PGN `TimeControl` and/or a time-control label.
+  Sources that disagree, or a declared value contradicted by two observed clock
+  jumps after our moves, make it *unknown*. Without a declaration, three tight
+  observations agreeing on the same second are accepted.
+- **Move-submission latency.** Measured from the engine's `bestmove` to the board
+  accepting the move. Reserve = 1.5 × the worst of the last 8 measurements + 100 ms
+  (range 250 ms–5 s; 500 ms before anything is measured) + display resolution.
+
+The reserve comes off our clock, and the read age comes off the running clock.
+Stockfish then allocates its own time. Missing, ambiguous, or contradictory clocks
+fall back to Think time, and the panel's *Clock* line shows the reason. An unknown
+increment is sent as 0, the conservative bound, and labelled.
+
+## Pondering on the web board (opt-in)
+
+When the native host allows it, Stockfish searches during the opponent's turn:
+
+1. After our move, Stockfish's `bestmove … ponder X` (or the PV's second move)
+   gives the expected reply. Once our move is on the board, the extension sends
+   `position <history> X` + `go ponder …` with the current clocks.
+2. If the opponent plays X (the history matches exactly), it sends `ponderhit`.
+   The same search continues and its move is played. Its elapsed time includes the
+   pondering, so it never overspends our clock.
+3. Any other reply, a takeback, a new game, a page change, or switching auto-play
+   or pondering off sends `stop`. The ponder answer is **discarded** and a normal
+   search runs on the real position.
+
+Pondering only runs when **all** of these hold, and the panel names the first
+that fails: the panel switch *Ponder on opponent's time* is on, Maximum Strength,
+auto-play, the native backend, a host installed with `--allow-ponder`, an engine
+with a `Ponder` option, a complete move history, and certain clock data. It uses
+CPU during the opponent's time. Whether pondering is permitted is a rule of the
+match, so it is off on both sides by default:
+
+```sh
+python3 native/install.py --extension-id YOUR_EXTENSION_ID \
+  --engine /absolute/path/to/stockfish --threads 4 --hash-mb 512 --allow-ponder
+```
+
+(or set `"ponder": true` in `native/config.json`). Without it, the host refuses
+`go ponder`, `ponderhit` and `setoption name Ponder value true`. The host now
+accepts only the exact grammar of the UCI commands the extension uses.
 
 ## Paired engine matches
 
@@ -96,17 +171,21 @@ measures native engine play, not browser UI or Hunter policy overhead.
 
 `--ponder` enables python-chess/UCI pondering for **both** engines in this local,
 controlled match environment. It is disabled by default to avoid shared-machine
-CPU contention. Web-board pondering is deliberately not enabled: the extension
-cannot reliably establish opponent-turn permissions and full move history there.
+CPU contention. Web-board pondering is the opt-in described above.
 
 ## Tests
 
 ```sh
+node tests/game.test.js
 node tests/maximum.test.js
 python3 tests/native_test.py
 # Integration suite needs jsdom:
 npm install --no-save --package-lock=false jsdom
 node tests/panel-logic.test.js
+# Optional: real-engine checks (repetition draw, go ponder / ponderhit / stop, and
+# the extension's full ponder flow through native/host.py):
+CT_STOCKFISH=/path/to/stockfish python3 tests/native_test.py
+CT_STOCKFISH=/path/to/stockfish node tests/panel-logic.test.js
 ```
 
 The host uses only Python's standard library. `python-chess` is needed only for

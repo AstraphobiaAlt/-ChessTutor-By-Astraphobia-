@@ -10,6 +10,7 @@
     <div id="ct-engine-row"><span class="ct-label">Engine</span><span id="ct-engine">Loading...</span></div>
     <div id="ct-verify" class="warn">Checking engine...</div>
     <div id="ct-engdetail"></div>
+    <div id="ct-context" aria-live="polite"></div>
 
     <div id="ct-main">
       <span id="ct-bestmove">-</span>
@@ -77,6 +78,7 @@
     <label class="ct-switch" title="Show or hide the extra arrows only. The engine keeps its candidate lines for mate checks and Natural mistakes either way."><span>Top 3 moves</span><input type="checkbox" id="ct-top3"></label>
     <label class="ct-switch"><span>Auto-analyze</span><input type="checkbox" id="ct-auto"></label>
     <label class="ct-switch"><span>Auto-play</span><input type="checkbox" id="ct-autoplay"></label>
+    <label class="ct-switch" id="ct-ponderrow" title="Maximum Strength + auto-play + native backend installed with --allow-ponder: Stockfish keeps searching the predicted reply during the opponent's turn and continues with ponderhit if it is played. Only turn this on where the match rules allow pondering."><span>Ponder on opponent's time</span><input type="checkbox" id="ct-ponder"></label>
     <div class="ct-field" id="ct-autoplay-elorow">
       <span class="ct-label" title="Strength used for auto-play only. It shares the Think time above: 400 ELO still gets the full window, it just answers from a shallower search.">Auto-play ELO</span>
       <select id="ct-autoplay-elo" aria-label="Auto-play ELO">

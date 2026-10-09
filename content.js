@@ -2,8 +2,8 @@
   'use strict';
   if (window.__chessTutorLoaded) return;
   window.__chessTutorLoaded = true;
-  const L = window.CTLib;
-  if (!L) { console.warn('Chess Tutor: lib.js did not load'); return; }
+  const L = window.CTLib, G = window.CTGame;
+  if (!L || !G) { console.warn('Chess Tutor: lib.js / game.js did not load'); return; }
 
   // ---------- Config ----------
   // The ELO presets are the strength target: the depth the answer is read from. They are not a search cap -
@@ -33,7 +33,10 @@
     // aggressive sound candidate - check, bait, attack on the king - within huntRisk of the best line.
     // huntRisk = how much evaluation the hunter may give up for that: sound 0.3 / balanced 0.6 / very 1.2 pawns.
     // mistakes = the low-ELO deviation roll that makes play look human instead of engine-perfect.
-    autoplay: false, autoplayElo: 3200, mateMode: 'shortest', huntRisk: 'very', mistakes: true
+    autoplay: false, autoplayElo: 3200, mateMode: 'shortest', huntRisk: 'very', mistakes: true,
+    // ponder = search the predicted reply on the opponent's time (Maximum Strength + native host that allows it).
+    // Off by default: whether pondering is permitted is a rule of the match, not something the tutor can see.
+    ponder: false
   };
   const S = Object.assign({}, DEFAULTS);
   const DEPTH_INF = 40;            // slider maximum = no strength cap: play the deepest line
@@ -81,6 +84,15 @@
   let revealTimer = null, hideTimer = null, drag = null, panelHover = false, panelFocus = false;
   let analysisSeq = 0, polling = false, mismatch = 0, pollTimer = null;
   let boardObserver = null, observedBoard = null, autoPollQueued = false, autoPollScheduled = false;
+  // ---- game context (game.js does the rules; this is the state the page has seen) ----
+  let hist = null;                 // move history rebuilt from the board: see G.advanceHistory
+  let listTried = '';              // last board move-list signature that was replayed (do not redo it every poll)
+  let clockSamples = [];           // recent clock readings (to see which clock ticks if the page does not say)
+  const latencies = [];            // measured bestmove -> board-accepted move latencies (ms), last 12
+  let incObs = [];                 // observed increments this game: { estMs, tolMs }
+  let incProbe = null;             // own clock just before our move, to measure the increment afterwards
+  let ponderPlan = null;           // { base, move } - after our move, ponder `move` once `base` is on the board
+  let clockNote = '', ponderNote = '';
 
   // ---------- Move choice + formatting (the rules themselves live in lib.js so the tests can drive them) ----------
   const fmtSecs = v => v <= 0 ? 'instant' : (Math.round(v * 100) / 100) + 's';
@@ -98,6 +110,7 @@
     S.mateMode = ['normal', 'shortest', 'hunter', 'maximum'].includes(S.mateMode) ? S.mateMode : 'shortest';
     S.huntRisk = ['sound', 'balanced', 'very'].includes(S.huntRisk) ? S.huntRisk : 'very';
     S.mistakes = S.mistakes !== false;                               // mistakes stay on unless explicitly turned off
+    S.ponder = S.ponder === true;                                    // pondering is strictly opt-in
     if (!['me', 'turn', 'w', 'b'].includes(S.side)) S.side = 'me';
     // "speed" belonged to the old paced auto-play UI. Delete it on load so every upgraded installation now has
     // the same no-added-delay behavior, rather than silently retaining a stored wait.
@@ -138,7 +151,8 @@
     return 'w';
   }
 
-  // exact FEN straight from chess.com's board object (page-bridge.js runs in the page world)
+  // exact FEN straight from chess.com's board object (page-bridge.js runs in the page world), plus - when the
+  // board exposes them - its own move list and PGN headers. Those are only hints: see updateHistory.
   let bridgeSeq = 0;
   function bridgeFen(timeout = 350) {
     return new Promise(res => {
@@ -147,10 +161,12 @@
       const t = setTimeout(() => { off(); res(null); }, timeout);
       const h = e => {
         if (e.source !== window || !e.data || e.data.ctRes !== 1 || e.data.id !== id) return;
-        off(); res(e.data.ok ? e.data.fen : null);
+        off();
+        const d = e.data;
+        res(d.ok && typeof d.fen === 'string' ? { fen: d.fen, history: d.history || null, headers: d.headers || null } : null);
       };
       window.addEventListener('message', h);
-      window.postMessage({ ctReq: 1, id }, '*');
+      window.postMessage({ ctReq: 1, id, context: true }, '*');
     });
   }
 
@@ -182,16 +198,117 @@
     let fen = null, src = 'dom';
     const bf = await bridgeFen();
     if (bf) {
-      if (bf.split(' ')[0] === domPlacement) { fen = bf; src = 'board'; mismatch = 0; }
+      if (bf.fen.split(' ')[0] === domPlacement) { fen = bf.fen; src = 'board'; mismatch = 0; }
       else if (++mismatch < 4) return { settling: true };     // board is mid-animation / mid-drag: wait a tick
     }
     if (!fen) fen = L.buildFen(pieces, domMover(b, pieces));
     const mover = fen.split(' ')[1] === 'b' ? 'b' : 'w';
+    const history = updateHistory(fen, src, src === 'board' ? bf : null);
     // Never rewrite the FEN turn. Analysing an invented side to move can produce a move that chess.com's board
     // must reject; the selected side controls when we act, while the actual board turn controls legality.
-    return { board: b, turn: mover, mover, me, flipped, src, fen };
+    // `cmd` is what the engine is sent: the start position plus every move, whenever the game could be followed.
+    return { board: b, turn: mover, mover, me, flipped, src, fen, history,
+      cmd: G.positionCommand(history) || 'position fen ' + fen, headers: (src === 'board' && bf && bf.headers) || null };
+  }
+
+  /* Follow the game move by move. Each stable board reading must be one or two LEGAL moves on from the last one
+     (or a step back to an earlier position, or a new game); the engine then gets `position startpos moves ...`
+     and sees repetitions. When the history is not complete (the tutor joined mid-game), a move list exposed by
+     the board itself is replayed and used only if it lands exactly on the current position. */
+  function updateHistory(fen, src, bf) {
+    const step = G.advanceHistory(hist, fen, src);
+    let h = step.h;
+    if (!h) return hist;
+    if (src === 'board' && bf && bf.history && Array.isArray(bf.history.moves) && !h.complete) {
+      const hd = bf.headers || {};
+      const start = hd.FEN && hd.SetUp !== '0' ? hd.FEN : null;
+      const sig = fen + '|' + (start || '') + '|' + bf.history.moves.map(m => typeof m === 'string' ? m : (m.san || (m.from || '') + (m.to || ''))).join(' ');
+      if (sig !== listTried) {
+        listTried = sig;
+        const listed = G.historyFromMoves(start, bf.history.moves, fen);
+        if (listed && (listed.complete || listed.plies > h.plies)) { listed.resets = h.resets; h = listed; }
+      }
+    }
+    if (step.change === 'reset' || step.change === 'back') newGameContext(step.change);
+    hist = h;
+    return h;
+  }
+  // A new game (or a takeback) invalidates what was learned about this game's clocks and any ponder plan.
+  function newGameContext(why) {
+    if (why === 'reset') { incObs = []; clockSamples = []; }
+    incProbe = null; ponderPlan = null;
+    if (engine && engine.isPondering && engine.isPondering()) { engine.cancelPonder(); ponderNote = 'stopped (' + (why === 'reset' ? 'new game' : 'takeback') + ')'; }
+  }
+
+  // ---------- Clock adapter ----------
+  /* One reading of both clocks. Every part must be unambiguous: exactly one white and one black clock on the
+     page, one readable time in each. Anything else is an error string, which makes the search fall back to
+     Think time and say why. Whose clock runs comes from the page's own marker class (or, failing that, from
+     which clock was seen ticking - G.activeClock). */
+  const ACTIVE_CLOCK = ['clock-player-turn', 'clock-running', 'clock-active'];
+  function readClocks() {
+    const now = Date.now(), out = { ts: now, plies: hist ? hist.plies : -1, key: hist ? hist.fens[hist.fens.length - 1] : '' };
+    for (const c of ['white', 'black']) {
+      const boxes = [...document.querySelectorAll('.clock-' + c)].filter(n => !n.closest('#ct-root') && !n.parentElement.closest('.clock-' + c));
+      if (boxes.length !== 1) return { ts: now, error: boxes.length ? 'more than one ' + c + ' clock on the page' : 'no ' + c + ' clock found' };
+      const box = boxes[0];
+      const texts = [...new Set([...box.querySelectorAll('.clock-time-monospace, .clock-time, [role="timer"]')]
+        .map(n => n.textContent.trim()).filter(Boolean))];
+      if (texts.length !== 1) return { ts: now, error: texts.length ? c + ' clock is ambiguous' : c + ' clock shows no time' };
+      const ms = G.clockMs(texts[0]);
+      if (ms === null) return { ts: now, error: c + ' clock unreadable ("' + texts[0].slice(0, 12) + '")' };
+      out[c] = ms; out[c + 'Res'] = G.clockResolution(texts[0]);
+      out[c + 'Active'] = ACTIVE_CLOCK.some(k => box.classList.contains(k));
+    }
+    return out;
+  }
+  // a reading, plus the most recent earlier one of the SAME position at least ~1s older (to see a clock tick)
+  function sampleClocks() {
+    const cur = readClocks();
+    if (cur.error) return { cur, prev: null };
+    clockSamples = clockSamples.filter(x => x.key === cur.key && cur.ts - x.ts < 5000);
+    const prev = clockSamples.filter(x => cur.ts - x.ts >= 1100).pop() || null;
+    clockSamples.push(cur);
+    return { cur, prev };
+  }
+  // Time-control labels on the page (minutes, "3 | 2"). Several that disagree are all reported, not picked from.
+  function timeControlLabels() {
+    const seen = new Set(), out = [];
+    document.querySelectorAll('[data-cy*="time-control"], [class*="time-control"]').forEach(n => {
+      if (n.closest('#ct-root')) return;
+      const t = (n.textContent || '').trim();
+      if (!t || t.length > 20) return;
+      const tc = G.parseTimeControlLabel(t);
+      if (tc && !seen.has(tc.incMs)) { seen.add(tc.incMs); out.push({ source: 'time-control label', incMs: tc.incMs }); }
+    });
+    return out;
+  }
+  function incrementState(pos) {
+    const declared = [];
+    const pgn = pos && pos.headers && pos.headers.TimeControl ? G.parsePgnTimeControl(pos.headers.TimeControl) : null;
+    if (pgn) declared.push({ source: 'game TimeControl', incMs: pgn.incMs });
+    return G.resolveIncrement(declared.concat(timeControlLabels()), incObs);
+  }
+  /* After our move the own clock stops: its value then, minus its value just before the move, plus the time the
+     move took, is the increment that was really added. Display resolution and timing jitter are the tolerance.
+     The first move of each side is skipped (sites often do not run the clock or add increment there). */
+  function observeIncrement(pos) {
+    const probe = incProbe;
+    if (!probe || pos.cmd !== probe.cmdAfter) return;
+    incProbe = null;
+    if (probe.plies < 2) return;
+    setTimeout(() => {
+      if (!hist || G.positionCommand(hist) !== probe.cmdAfter) return;     // the opponent already replied
+      const c = readClocks();
+      if (c.error) return;
+      const name = probe.side === 'w' ? 'white' : 'black';
+      const est = c[name] - (probe.before - (probe.at - probe.ts));
+      incObs.push({ estMs: Math.round(est), tolMs: probe.res + c[name + 'Res'] + 300 });
+      if (incObs.length > 8) incObs.shift();
+    }, 300);
   }
   const keyOf = p => p.fen.split(' ').slice(0, 4).join(' ') + '|' + p.mover + S.side;
+  const otherSide = side => side === 'w' ? 'b' : 'w';
 
   // ---------- Search limits ----------
   const maximumOn = () => S.mateMode === 'maximum';
@@ -200,14 +317,22 @@
   // The ELO level is the strength target, Think time is the clock. They are separate on purpose: the engine is
   // allowed to keep searching for the whole think time even at 400 ELO, and the move it answers/plays is then
   // taken from that level's depth. Auto-play dispatches as soon as that search returns - no extra pacing timer.
-  function limits() {
+  /* Maximum Strength: the clock adapter decides. Both clocks, whose clock runs, the increment and the measured
+     latency reserve must all be known (G.clockLimits); otherwise Think time is used and the reason is shown.
+     opts.ponder builds the `go ponder` search for the position AFTER the predicted reply: our side is then the
+     side to move, while the opponent's clock is the one running right now. */
+  function limits(pos, opts) {
     if (maximumOn()) {
-      // Only use unambiguous colour-labelled clocks. Unknown increment is conservatively zero.
-      const clocks = ['white', 'black'].map(c => {
-        const nodes = S.autoplay ? document.querySelectorAll('.clock-' + c + ' .clock-time') : [];
-        return nodes.length === 1 ? L.clockMs(nodes[0].textContent) : null;
-      });
-      return L.maximumLimits(S.time, clocks[0], clocks[1]);
+      const ponder = !!(opts && opts.ponder);
+      if (!S.autoplay || !pos) {
+        const lim = G.clockLimits({ time: S.time });
+        lim.clockOk = false;
+        lim.clockNote = 'Think time ' + (lim.timeMs / 1000) + 's (clocks are only used during auto-play)';
+        return lim;
+      }
+      const { cur, prev } = sampleClocks();
+      return G.clockLimits({ time: S.time, clocks: cur, prev, mover: ponder ? otherSide(pos.mover) : pos.mover,
+        expectActive: pos.mover, increment: incrementState(pos), latencies, now: Date.now(), ponder });
     }
     const depth = S.autoplay
       ? PRESETS[autoplayEloKey()]
@@ -224,6 +349,7 @@
       this.byDepth = {}; this.opts = {}; this.meta = null; this.waiters = []; this.collect = null;
       this.mpv = 0; this.hash = 0; this.threads = 1; this.nnue = null; this.selfTest = null;
       this.lastStage = null; this._idle = () => {}; this._done = () => {};
+      this.optVals = {}; this.wantOpts = {};   // UCI options changed between searches (never during one)
     }
     async init() {
       const frame = document.createElement('iframe');
@@ -380,7 +506,8 @@
         return;
       }
       if (!l.startsWith('bestmove')) return;
-      const cur = this.cur; if (cur) cur.bestmove = l.split(/\s+/)[1];
+      const cur = this.cur, parts = l.split(/\s+/);
+      if (cur) { cur.bestmove = parts[1]; cur.ponderMove = parts[2] === 'ponder' ? parts[3] : null; }
       this.cur = null; this.busy = false;
       this.settle(cur);
       if (this.queued) { const q = this.queued; this.queued = null; this.run(q); }
@@ -415,7 +542,10 @@
         if (line && line.type === 'mate' && line.score > 0) mateLines.push(line);
       }));
       const top = ds.length ? this.byDepth[Math.max(...ds)][1] || lines[0] : null;   // latest stats for line 1
+      const finalPv = (lines[0] && lines[0].pv) || (top && top.pv) || [];
       cur.resolve({ lines, deepLines, mateLines, eager: !!eager,
+        bestmove: cur.bestmove || null, ponder: cur.ponderMove || null, pv: finalPv, doneAt: Date.now(),
+        pondered: cur.hitAt ? { ms: cur.hitAt - cur.startedAt } : null,
         // how deep the engine actually got inside the think time: the panel shows it, so a low level that thinks
         // long is visibly "searching harder than it plays" rather than looking stuck
         searchDepth: ds.length ? Math.max(...ds) : null,
@@ -433,22 +563,63 @@
       this.settle(cur, true);
       this.send('stop');
     }
-    analyze(fen, lim, mpv) {
+    // `position` is either a full UCI position command (history-aware: `position startpos moves ...`) or a FEN.
+    analyze(position, lim, mpv) {
       return new Promise(resolve => {
-        const job = { fen, lim, mpv: mpv || 1, resolve, superseded: false, settled: false, eager: !!(lim && lim.eager) };
+        const job = { pos: String(position).startsWith('position ') ? position : 'position fen ' + position,
+          lim, mpv: mpv || 1, resolve, superseded: false, settled: false, eager: !!(lim && lim.eager) };
         if (this.busy) {
           if (this.queued) this.queued.resolve(null);
           this.queued = job;
-          if (this.cur) this.cur.superseded = true;
-          this.send('stop');
+          // one `stop` per search: a cancelled ponder search has already been told to stop
+          if (this.cur && !this.cur.superseded) { this.cur.superseded = true; this.send('stop'); }
+          else if (!this.cur) this.send('stop');
         } else this.run(job);
       });
     }
     run(job) {
-      this.busy = true; this.cur = job; this.byDepth = {};
+      this.busy = true; this.cur = job; this.byDepth = {}; job.startedAt = Date.now();
       if (this.mpv !== job.mpv) { this.send('setoption name MultiPV value ' + job.mpv); this.mpv = job.mpv; }
-      this.send('position fen ' + job.fen);
-      this.send(L.goCommand(job.lim));
+      for (const name of Object.keys(this.wantOpts)) {
+        if (this.optVals[name] !== this.wantOpts[name]) { this.send('setoption name ' + name + ' value ' + this.wantOpts[name]); this.optVals[name] = this.wantOpts[name]; }
+      }
+      this.send(job.pos);
+      this.send(G.goCommand(job.lim));
+    }
+    // applied right before the next search starts, because UCI options must not change during one
+    wantOption(name, value) { if (this.opts[name]) this.wantOpts[name] = String(value); }
+
+    /* ---- pondering ----
+       ponder(): from idle, search the position after the predicted reply with `go ponder`. Nobody waits on it.
+       ponderhit(): the predicted reply was played - the same search continues as a normal one (its elapsed time
+                    already includes the pondering, so it never overspends the clock) and this resolves with it.
+       cancelPonder(): any other reply, a takeback, a new game, auto-play off - `stop`, and the bestmove that
+                    comes back is discarded (it belongs to a position that did not happen). */
+    ponder(position, lim, base) {
+      if (this.busy || !this.ready) return false;
+      this.run({ pos: position, base, lim: Object.assign({}, lim, { ponder: true }), mpv: 1, resolve: () => {},
+        superseded: false, settled: false, eager: false, ponder: true });
+      return true;
+    }
+    isPondering(position) {
+      const c = this.cur;
+      return !!(c && c.ponder && !c.superseded && !c.settled && (position === undefined || c.pos === position));
+    }
+    get ponderBase() { return this.isPondering() ? this.cur.base : null; }
+    ponderhit() {
+      const cur = this.cur;
+      if (!this.isPondering()) return Promise.resolve(null);
+      return new Promise(resolve => {
+        cur.resolve = resolve; cur.ponder = false; cur.hitAt = Date.now();
+        cur.lim = Object.assign({}, cur.lim, { ponder: false });
+        this.send('ponderhit');
+      });
+    }
+    cancelPonder() {
+      if (!this.isPondering()) return false;
+      this.cur.superseded = true;
+      this.send('stop');
+      return true;
     }
   }
 
@@ -472,6 +643,7 @@
           if (d.line.startsWith('id name ')) this.meta.idName = d.line.slice(8);
           if (d.line.startsWith('option ')) { const o = L.parseOption(d.line); if (o) this.opts[o.name] = o; }
           if (d.line.startsWith('info string CT ')) this.nativeDetail = d.line.slice(15);
+          if (d.line.startsWith('info string CT-CAPS ')) this.hostPonder = /\bponder=1\b/.test(d.line);
           this.onLine(d.line);
         }
       });
@@ -594,7 +766,10 @@
   }
   function updateTip() {
     if (maximumOn()) {
-      el.tip.textContent = 'Maximum Strength: uncapped search, one principal variation, no mistakes or speculative sacrifices. Uses readable clocks (unknown increment = 0); otherwise Think time, minimum 1s. Forced mates only—not guaranteed instant mate. Native backend is optional; see native/README.md.';
+      el.tip.textContent = 'Maximum Strength: uncapped search, one principal variation, no mistakes or speculative sacrifices. ' +
+        'The engine gets the start position plus every move (repetition-aware). During auto-play both clocks, the running side and the increment ' +
+        'go to Stockfish\'s time manager minus a measured latency reserve; any uncertainty falls back to Think time (minimum 1s) and says why. ' +
+        'Forced mates only - not guaranteed instant mate. Native backend is optional; see native/README.md.';
       el.eloBtn.textContent = 'Show maximum-strength move';
       return;
     }
@@ -609,7 +784,9 @@
   }
   function updateAutoHint() {
     if (maximumOn()) {
-      el.autohint.textContent = 'Maximum Strength · ' + (S.autoplay ? 'auto-play on' : 'auto-play off') + '. Full-depth engine best move; clock-aware when both clocks are readable. Training/bot matches only. Pondering is available in the local match harness, not on web boards.';
+      el.autohint.textContent = 'Maximum Strength · ' + (S.autoplay ? 'auto-play on' : 'auto-play off') + '. Full-depth engine best move; clock-aware when the clock data is certain. ' +
+        (S.ponder ? 'Pondering on: needs the native host installed with --allow-ponder; only where the match rules allow it. ' : 'Pondering off. ') +
+        'Training/bot matches only.';
       el.autohint.classList.toggle('on', S.autoplay);
       return;
     }
@@ -651,7 +828,9 @@
     el.panel.style.opacity = String(S.opacity / 100);
     el.autoplayElo.value = String(autoplayEloKey());
     el.autoplay.checked = S.autoplay;
-    updateTip(); updateAutoHint();
+    el.ponder.checked = S.ponder;
+    el.ponderRow.style.display = maximumOn() ? '' : 'none';   // pondering only exists in Maximum Strength
+    updateTip(); updateAutoHint(); showContext();
   }
   function setBar(line, turn) {
     el.barfill.style.width = Math.max(3, Math.min(97, L.whitePct(line, turn))) + '%';
@@ -670,26 +849,51 @@
     el.fen.textContent = pos.fen;
     lastKeySeen = keyOf(pos);
     lastEloMove = null; lastResult = null; render();          // hide arrows until the answer is final
+    // A ponder search is only kept while the board still shows the position it started from (opponent thinking)
+    // or the exact predicted continuation (ponderhit below). Any other position cancels it.
+    const hit = !!(engine.isPondering && ourTurn(pos) && engine.isPondering(pos.cmd));
+    if (engine.isPondering && engine.isPondering() && !hit && engine.ponderBase !== pos.cmd) {
+      engine.cancelPonder();
+      ponderNote = 'predicted reply not played - ponder search stopped and discarded';
+    }
+    showContext();
     if (!ourTurn(pos)) {
       el.best.textContent = '-';
       setStatus(sideLabel(sideForPosition(pos)) + ' to move - waiting');
+      if (maximumOn() && S.autoplay) { observeIncrement(pos); startPonder(pos); }
       return;
     }
     if (!engine.ready) { setStatus('Engine loading...'); return; }
-    const lim = limits(), t0 = Date.now();
+    const t0 = Date.now();
+    // ponderhit keeps the time limits the ponder search was started with (our clock has not moved since)
+    let lim = hit ? Object.assign({}, engine.cur.lim, { ponder: false }) : limits(pos);
+    if (maximumOn()) {
+      clockNote = lim.clockNote || '';
+      if (!hit) engine.wantOption('Ponder', ponderGateFor(pos, lim).ok ? 'true' : 'false');
+      showContext();
+    }
     const strength = maximumOn() ? 'Maximum Strength' : S.autoplay ? 'auto-play ' + autoplayLevelLabel() + ' ELO' : levelLabel() + ' ELO';
     const goal = S.mateMode === 'shortest' ? ', preferring the shortest proven mate'
       : S.mateMode === 'hunter' ? ', hunting mate / check / bait (' + huntLabel() + ')' : ', regular best move';
-    setStatus((S.time > 0 ? 'Thinking for ' + fmtSecs(S.time) + ' (' + strength + goal + ')...' : 'Searching (' + strength + goal + ')...'));
+    setStatus(hit ? 'Ponderhit: the predicted reply was played - continuing the search started on the opponent\'s time...'
+      : maximumOn() && lim.clocks ? 'Thinking on the clock (Maximum Strength, Stockfish time management)...'
+        : (S.time > 0 ? 'Thinking for ' + fmtSecs(S.time) + ' (' + strength + goal + ')...' : 'Searching (' + strength + goal + ')...'));
     // The search keeps multiple PVs for mate proofs and, when enabled, realistic candidate deviations, independent
     // of whether their arrows are shown. Auto-play gets five; the hunter asks for more (plus the deepest iteration)
     // because a check or bait can sit well below the quiet top lines.
-    const r = await engine.analyze(pos.fen, lim, mpvFor());
+    // The engine always gets the history-aware position (start position + every move) when the game was followed.
+    let r = hit ? await engine.ponderhit() : null;
+    if (hit && r) ponderNote = 'ponderhit - search continued after ' + (r.pondered ? (r.pondered.ms / 1000).toFixed(1) + 's' : 'some time') + ' on the opponent\'s time';
+    if (!r && seq === analysisSeq) {
+      if (hit) { lim = limits(pos); clockNote = lim.clockNote || clockNote; }   // the ponder search vanished: plain search
+      r = await engine.analyze(pos.cmd, lim, mpvFor());
+    }
     if (!r) return;                                           // superseded by a newer request
     if (seq !== analysisSeq) return;
     const now = await readPosition();
     if (!now || now.settling || keyOf(now) !== keyOf(pos)) return;   // board changed while thinking; poll restarts
     if (!r.lines.length) { setStatus(maximumOn() ? 'No usable final engine line (game over or insufficient search output). No move played.' : 'No legal moves (game over?).'); return; }
+    r.clockManaged = !!(maximumOn() && lim.clocks);
     const pool = huntPoolFor(r);                              // hunter: level depth + deepest iteration
     // In hunter mode the headline move and arrow 1 ARE the hunter's choice, so what the panel shows is what the
     // style would actually play; the engine's remaining candidates follow it. The other styles show the search.
@@ -705,14 +909,14 @@
     const shown = displayPick
       ? [displayPick.line].concat(displayPool.filter(l => l.move !== displayPick.uci && l.depth === displayPick.line.depth))
       : r.lines;
-    lastResult = { fen: pos.fen, lines: shown, choiceLines: pool, turn: pos.turn, mateLines: mateLines };
+    lastResult = { fen: pos.fen, cmd: pos.cmd, lines: shown, choiceLines: pool, turn: pos.turn, mateLines: mateLines };
     const top = shown[0];
     el.best.textContent = L.uciToSan(top.move, pos.fen); el.best.title = top.move;
     el.eval.textContent = L.evalText(top, pos.turn);
     setBar(top, pos.turn);
     el.elotxt.textContent = '-';
     const spentMs = Date.now() - t0;
-    let msg = 'Thought ' + (spentMs / 1000).toFixed(2) + 's · played from depth ' + top.depth +
+    let msg = (r.pondered ? 'Ponderhit · ' : '') + 'Thought ' + (spentMs / 1000).toFixed(2) + 's · played from depth ' + top.depth +
       (lim.playDepth ? '/' + lim.playDepth : '') +
       (r.searchDepth > top.depth ? ' (searched to ' + r.searchDepth + ')' : '') + ' \u00B7 ' +
       L.fmtCount(r.stats.nodes) + ' nodes' +
@@ -732,11 +936,52 @@
     } else {
       if (lim.playDepth && top.depth < lim.playDepth) msg += ' (target depth not reached in ' + fmtSecs(S.time) + ' - raise Think time)';
       // a `go movetime` window only ends early when the engine has nothing left to search (a single legal move)
-      if (lim.timeMs > 0 && spentMs < lim.timeMs * 0.9) msg += ' (nothing left to think about here)';
+      if (lim.timeMs > 0 && spentMs < lim.timeMs * 0.9 && !r.pondered) msg += ' (nothing left to think about here)';
     }
+    if (maximumOn()) msg += lim.clocks ? ' · clock-managed' : ' · Think time (clock fallback)';
     setStatus(msg);
+    showContext();
     render();
-    if (S.autoplay) autoPlay(pos, pool, mateLines).catch(() => {});
+    if (S.autoplay) autoPlay(pos, pool, mateLines, r).catch(() => {});
+  }
+
+  // ---------- Pondering ----------
+  function ponderGateFor(pos, lim) {
+    return G.ponderGate({ enabled: S.ponder, maximum: maximumOn(), autoplay: S.autoplay,
+      native: engine instanceof NativeEngine, hostAllows: !!(engine && engine.hostPonder),
+      engineOption: !!(engine && engine.opts && engine.opts.Ponder), historyComplete: !!(pos.history && pos.history.complete),
+      clocksOk: !!(lim && lim.clockOk) });
+  }
+  /* Our move is on the board and the opponent is thinking: if every condition holds, search the position after
+     the reply Stockfish expects. ponderPlan was made when the move was played and is consumed here once. */
+  function startPonder(pos) {
+    const plan = ponderPlan;
+    if (!plan || plan.base !== pos.cmd) return;
+    ponderPlan = null;
+    if (!plan.move) { ponderNote = 'no predicted reply from the engine'; showContext(); return; }
+    const lim = limits(pos, { ponder: true });
+    const gate = ponderGateFor(pos, lim);
+    if (!gate.ok) { ponderNote = 'not pondering: ' + gate.reason; showContext(); return; }
+    const cmd = G.positionCommand(pos.history, [plan.move]);
+    engine.wantOption('Ponder', 'true');
+    if (!cmd || !engine.ponder(cmd, lim, pos.cmd)) { ponderNote = 'not pondering: engine busy'; showContext(); return; }
+    ponderNote = 'pondering ' + (G.sanOf(pos.fen, plan.move) || plan.move) + ' (predicted reply) on the opponent\'s time';
+    setStatus(sideLabel(pos.mover) + ' to move - pondering the predicted reply ' + (G.sanOf(pos.fen, plan.move) || plan.move));
+    showContext();
+  }
+  function stopPondering(why) {
+    ponderPlan = null;
+    if (engine && engine.cancelPonder && engine.cancelPonder()) { ponderNote = 'stopped (' + why + ')'; showContext(); }
+  }
+  // History / clock / ponder state, one line each, so it is visible what the engine was actually told
+  function showContext() {
+    if (!el.context) return;
+    const rows = ['History: ' + G.historyLabel(hist)];
+    if (maximumOn()) {
+      if (clockNote) rows.push('Clock: ' + clockNote);
+      rows.push('Ponder: ' + (S.ponder ? (ponderNote || 'enabled - waits for our move and a predicted reply') : 'off'));
+    }
+    el.context.textContent = rows.join('\n');
   }
 
   // ---------- Auto-play ----------
@@ -778,7 +1023,7 @@
   // Play one move for the analyzed position. Nothing here trusts the analysis: the board is re-read, and the
   // move goes through chess.com's own legal-move list (page-bridge), so a stale position simply does nothing.
   // There is intentionally no extra pace timer: Think time was already spent searching for this move.
-  async function autoPlay(pos, lines, mateLines) {
+  async function autoPlay(pos, lines, mateLines, result) {
     if (!S.autoplay || playing || !engine || !engine.ready || !lines || lines.length < 1 || !ourTurn(pos)) return;
     const key = keyOf(pos);
     if (playAttempt && playAttempt.key === key && playAttempt.ok) return;      // already moved for this position
@@ -787,7 +1032,7 @@
     // Yield only to the board/FEN request needed for stale-move protection; the move itself goes straight out.
     const now = await readPosition();
     if (!S.autoplay || !now || now.settling || keyOf(now) !== key || !ourTurn(now)) return;
-    await tryPlay(now, choice.uci, choice);
+    await tryPlay(now, choice.uci, Object.assign({}, choice, { result: result || null }));
   }
 
   // One attempt on chess.com's board. Whether it worked is judged by the board itself: an accepted move changes
@@ -805,15 +1050,38 @@
     const huntTraits = hunt && huntOn() && L.aggressionScore(hunt) ? L.huntNote(hunt) : '';
     const huntNote = !mateNote && huntTraits ? ' · hunter: ' + huntTraits : '';
     const slipNote = mistake ? ' · natural ' + autoplayLevelLabel() + ' ELO slip' : '';
+    // Maximum Strength: note our clock right before the move (to measure the increment afterwards)
+    const result = info && info.result, measure = maximumOn() && S.autoplay && prior === 0;
+    const pre = measure ? readClocks() : null, side = pos.mover === 'w' ? 'white' : 'black';
+    const cmdAfter = pos.history ? G.positionCommand(pos.history, [uci]) : null;
+    // Both are armed BEFORE the move goes out: the board can show the new position (and the poll can react to it)
+    // before the bridge's answer arrives. They are keyed to the exact history after this move, so a move that does
+    // not land can never match them.
+    incProbe = pre && !pre.error && cmdAfter
+      ? { side: pos.mover, before: pre[side], res: pre[side + 'Res'], ts: pre.ts, plies: pos.history.plies, cmdAfter, at: Date.now() } : null;
+    // the opponent's most likely reply, for pondering once our move is on the board
+    ponderPlan = maximumOn() && S.autoplay && cmdAfter
+      ? { base: cmdAfter, move: G.ponderMove(G.playUci(pos.fen, uci) || pos.fen, result && result.ponder, result && result.pv) } : null;
     playing = true;
     let res;
     try { res = await playMove(uci); } finally { playing = false; }
+    if (!(res.ok && res.confirmed)) {
+      if (incProbe && incProbe.cmdAfter === cmdAfter) incProbe = null;
+      if (ponderPlan && ponderPlan.base === cmdAfter && !res.ok) ponderPlan = null;
+    }
+    if (res.ok && res.confirmed && measure && result && result.doneAt) {
+      // move-submission latency: engine answer -> board accepted the move (re-check + bridge round trip)
+      latencies.push(Date.now() - result.doneAt);
+      if (latencies.length > 12) latencies.shift();
+    }
     if (res.ok) {
       // an API move is confirmed by the board; a synthetic click is only reported once the board confirms it
       playAttempt.ok = !!res.confirmed;
       lastEloMove = uci; render();
       el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote + huntNote + slipNote;
-      const when = S.time > 0 ? ' after ' + fmtSecs(S.time) + ' of thinking' : ' instantly';
+      const when = result && result.pondered ? ' after ponderhit (' + (result.pondered.ms / 1000).toFixed(1) + 's pondered on the opponent\'s time)'
+        : result && result.clockManaged ? ' (clock-managed search)'
+          : S.time > 0 ? ' after ' + fmtSecs(S.time) + ' of thinking' : ' instantly';
       setStatus(res.confirmed
         ? 'Auto-played ' + (res.san || san) + when + mateNote + huntNote + slipNote
         : 'Auto-play: sent ' + san + when + ' - waiting for the board to confirm it' + mateNote + huntNote + slipNote);
@@ -857,7 +1125,7 @@
     let lines = base.choiceLines || base.lines;
     let mateLines = base.mateLines || [];
     if (!maximumOn() && lines.length < 3 && engine && engine.ready) {
-      const r = await engine.analyze(base.fen, limits(), mpvFor());
+      const r = await engine.analyze(base.cmd || base.fen, limits(), mpvFor());
       if (!lastResult || lastResult.fen !== base.fen) return;
       if (r && r.lines.length) {
         lines = r.deepLines && huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
@@ -932,6 +1200,7 @@
     try {
       const pos = await readPosition();
       if (!pos || pos.settling) return;
+      if (maximumOn() && S.autoplay) sampleClocks();   // so a ticking clock can be recognised if the page has no marker
       const key = keyOf(pos);
       if (key !== lastKeySeen) {
         lastKeySeen = key; lastResult = null; lastEloMove = null; clearOverlay();
@@ -1062,7 +1331,8 @@
       hash: q('ct-hash'), opacity: q('ct-opacity'), opacityVal: q('ct-opacityval'),
       analyze: q('ct-analyze'), eloBtn: q('ct-elomove'), status: q('ct-status'), best: q('ct-bestmove'), eval: q('ct-eval'),
       engine: q('ct-engine'), verify: q('ct-verify'), engdetail: q('ct-engdetail'), barfill: q('ct-barfill'),
-      elotxt: q('ct-elotxt'), tip: q('ct-tip'), fen: q('ct-fen')
+      elotxt: q('ct-elotxt'), tip: q('ct-tip'), fen: q('ct-fen'), context: q('ct-context'),
+      ponder: q('ct-ponder'), ponderRow: q('ct-ponderrow')
     };
     el.side.value = S.side;
     el.bestCb.checked = S.showBest; el.top3.checked = S.showTop3; el.auto.checked = S.auto;
@@ -1112,8 +1382,14 @@
       saveSettings(); updateTip(); updateAutoHint();
       if (lastResult && !huntOn()) rerunSoon();   // update a random pick; the deliberate hunter is unaffected
     });
+    el.ponder.addEventListener('change', () => {
+      S.ponder = el.ponder.checked; saveSettings(); updateAutoHint();
+      if (!S.ponder) stopPondering('pondering switched off');
+      ponderNote = ''; showContext();
+    });
     el.autoplay.addEventListener('change', () => {
       S.autoplay = el.autoplay.checked; saveSettings(); updateAutoHint();
+      if (!S.autoplay) stopPondering('auto-play off');
       if (playAttempt && !playAttempt.ok) playAttempt = null;
       if (S.autoplay) {
         watchBoard(getBoard());
@@ -1242,6 +1518,7 @@
     setInterval(() => {
       if (location.pathname === lastPath) return;
       lastPath = location.pathname; lastResult = null; lastEloMove = null; lastKeySeen = ''; analysisSeq++;
+      stopPondering('page changed');
       clearOverlay();
       startEngine();
     }, 800);

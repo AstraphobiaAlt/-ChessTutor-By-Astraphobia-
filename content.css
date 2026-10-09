@@ -56,6 +56,8 @@
 #ct-verify.ok { color: var(--ct-green); }
 #ct-verify.warn { color: var(--ct-amber); }
 #ct-engdetail { font-size: 0.66rem; color: var(--ct-faint); line-height: 1.35; margin-bottom: 0.6rem; word-break: break-word; }
+#ct-context { font-size: 0.66rem; color: var(--ct-faint); line-height: 1.35; margin: -0.35rem 0 0.6rem; word-break: break-word; white-space: pre-line; }
+#ct-context:empty { display: none; }
 
 #ct-main { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
 #ct-bestmove { font-size: 1.7rem; font-weight: 700; color: #fff; line-height: 1.1; }

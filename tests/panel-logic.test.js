@@ -20,7 +20,9 @@ try { ({ JSDOM } = require('jsdom')); } catch (e) {
 }
 
 const ROOT = path.join(__dirname, '..');
+const G = require('../game.js');
 const START = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const SELF_TEST_GO = 'go depth 10 movetime 8000';                // the browser engine's startup self-test
 const MOVE_POOL = ['e2e4', 'd2d4', 'g1f3', 'b1c3', 'a1a2'];      // MultiPV lines, best first
 
 let checks = 0, failures = 0;
@@ -40,17 +42,32 @@ async function until(pred, ms = 4000) {
 }
 
 // the DOM layout chess.com renders: .piece.<colour><type>.square-<file><rank>, file 1 = a
-function boardHtml() {
-  const back = ['r', 'n', 'b', 'q', 'k', 'b', 'n', 'r'];
+function piecesHtml(fen) {
   const cells = [];
-  for (let r = 1; r <= 8; r++) for (let f = 1; f <= 8; f++) {
-    let pc = null;
-    if (r === 1 || r === 2) pc = 'w' + (r === 1 ? back[f - 1] : 'p');
-    else if (r === 7 || r === 8) pc = 'b' + (r === 8 ? back[f - 1] : 'p');
-    if (pc) cells.push('<div class="piece ' + pc + ' square-' + f + r + '"></div>');
-  }
-  return '<wc-chess-board class="board">' + cells.join('') + '</wc-chess-board>';
+  fen.split(' ')[0].split('/').forEach((row, i) => {
+    let f = 1;
+    for (const ch of row) {
+      if (/\d/.test(ch)) { f += +ch; continue; }
+      const pc = (ch === ch.toUpperCase() ? 'w' : 'b') + ch.toLowerCase();
+      cells.push('<div class="piece ' + pc + ' square-' + f + (8 - i) + '"></div>');
+      f++;
+    }
+  });
+  return cells.join('');
 }
+function boardHtml(fen) { return '<wc-chess-board class="board">' + piecesHtml(fen || START) + '</wc-chess-board>'; }
+// the board moved on: DOM pieces and the board object's FEN change together, like on chess.com
+function setPosition(t, fen) {
+  t.log.fen = fen;
+  t.doc.querySelector('wc-chess-board').innerHTML = piecesHtml(fen);
+}
+// chess.com-style clocks: one component per colour, the running one flagged with clock-player-turn
+function clocksHtml(w, b, active) {
+  const one = (c, text, on) => '<div class="clock-component clock-' + c + (on ? ' clock-player-turn' : '') + '">' +
+    '<span class="clock-time-monospace" role="timer">' + text + '</span></div>';
+  return '<div id="clocks">' + one('white', w, active === 'w') + one('black', b, active === 'b') + '</div>';
+}
+function setClocks(t, w, b, active) { t.doc.querySelector('#clocks').outerHTML = clocksHtml(w, b, active); }
 
 /* A UCI engine that answers from `plan`: it searches `plan.depths` iterations with MultiPV lines, and puts a
    `mate in plan.mateScore` score on line `plan.mateOn` of the deepest iteration only - exactly the shape of a
@@ -74,37 +91,52 @@ function makeEngine(win, frameWin, log, plan, sink) {
           'Skill Level type spin default 20 min 0 max 20',
           'Move Overhead type spin default 10 min 0 max 5000',
           'UCI_LimitStrength type button',
-          'Use NNUE type button'].forEach(o => line('option name ' + o));
+          'Use NNUE type button'].concat(plan.ponderOption ? ['Ponder type check default false'] : []).forEach(o => line('option name ' + o));
+        if (plan.hostPonder !== undefined) line('info string CT-CAPS ponder=' + (plan.hostPonder ? 1 : 0));
         line('uciok');
       } else if (cmd === 'isready') line('readyok');
       else if (cmd === 'eval') line('NNUE evaluation used, 756732 bytes');
       else if (cmd.indexOf('setoption name MultiPV') === 0) this.mpv = +cmd.split(' value ')[1];
-      else if (cmd.indexOf('position fen ') === 0) log.fen = cmd.slice(13);
+      else if (cmd.indexOf('position ') === 0) log.position = cmd;
       else if (cmd.indexOf('go ') === 0) this.search(cmd);
       else if (cmd === 'stop') this.finish();
+      else if (cmd === 'ponderhit') { this.pondering = false; if (!this.pending || !this.pending.length) this.finish(); }
     },
     search(go) {
       log.go.push(go);
+      log.searches.push({ position: log.position, go });
+      this.pondering = /^go ponder/.test(go);
+      // plan.best / plan.ponder: what the "engine" answers (line 1 and `bestmove X ponder Y`)
+      this.best = plan.best || MOVE_POOL[0];
+      this.ponderReply = plan.ponder || null;
       const mpv = Math.min(this.mpv || 1, MOVE_POOL.length);
       const out = [];
       for (let d = 1; d <= plan.depths; d++) {
         for (let i = 1; i <= mpv; i++) {
           const mate = d === plan.depths && plan.mateOn === i && plan.mateScore;
+          const mv = i === 1 ? this.best : MOVE_POOL[i - 1];
           out.push('info depth ' + d + ' seldepth ' + (d + 2) + ' multipv ' + i + ' score ' +
             (mate ? 'mate ' + plan.mateScore : 'cp ' + (90 + d - i * 3)) + ' nodes ' + (d * 1000) +
-            ' nps 500000 time ' + (d * 40) + ' pv ' + MOVE_POOL[i - 1] + ' e2e4 d7d5');
+            ' nps 500000 time ' + (d * 40) + ' pv ' + mv + (i === 1 && this.ponderReply ? ' ' + this.ponderReply : ' e2e4 d7d5'));
         }
       }
       clearTimeout(this.timer);
       this.pending = out;
+      this.searching = true;
       this.step();
     },
     step() {
-      if (!this.pending || !this.pending.length) { this.finish(); return; }
+      // a ponder search never answers on its own: UCI says it waits for `ponderhit` or `stop`
+      if (!this.pending || !this.pending.length) { if (!this.pondering) this.finish(); return; }
       this.info(this.pending.shift());
       this.timer = setTimeout(() => this.step(), 1);
     },
-    finish() { clearTimeout(this.timer); this.pending = []; this.info('bestmove ' + MOVE_POOL[0]); },
+    finish() {
+      clearTimeout(this.timer); this.pending = []; this.pondering = false;
+      if (!this.searching) return;           // like a real engine: `stop` while idle answers nothing
+      this.searching = false;
+      this.info('bestmove ' + (this.best || MOVE_POOL[0]) + (this.ponderReply ? ' ponder ' + this.ponderReply : ''));
+    },
     info(l) { log.info.push(l); line(l); }
   };
 }
@@ -113,10 +145,11 @@ async function boot(settings, plan, opts) {
   opts = opts || {};
   const panelHtml = fs.readFileSync(path.join(ROOT, 'panel.html'), 'utf8');
   // the page the tutor runs on matters for the cache test: chess.com redirects a finished game to another path
-  const dom = new JSDOM('<!doctype html><html><body>' + boardHtml() + '</body></html>',
+  const dom = new JSDOM('<!doctype html><html><body>' + boardHtml(opts.fen) + (opts.extraHtml || '') + '</body></html>',
     { url: opts.page || 'https://www.chess.com/analysis', runScripts: 'outside-only' });
   const win = dom.window, doc = win.document;
-  const log = { cmds: [], info: [], go: [], moves: [], store: null, fen: START, cacheReplies: [] };
+  const log = { cmds: [], info: [], go: [], moves: [], store: null, fen: opts.fen || START, cacheReplies: [], searches: [],
+    position: null, history: opts.history || null, headers: opts.headers || null, ctx: [] };
   const planState = Object.assign({ depths: 4, mateOn: 0, mateScore: 0 }, plan);
   const engine = {};                     // handle on the fake engine, handy when a case needs debugging
   if (opts.caches) win.caches = opts.caches;
@@ -133,7 +166,8 @@ async function boot(settings, plan, opts) {
       }
     }
   };
-  if (opts.native) {
+  if (opts.connect) win.chrome.runtime.connect = opts.connect;      // e.g. a real native host process
+  else if (opts.native) {
     win.chrome.runtime.connect = () => {
       let listener, disconnected;
       const api = makeEngine(win, null, log, planState, d => listener(d));
@@ -152,18 +186,23 @@ async function boot(settings, plan, opts) {
   const realPost = win.postMessage.bind(win);
   win.postMessage = (msg, o) => {
     if (!msg) return realPost(msg, o);
-    if (msg.ctReq) return setTimeout(() => win.dispatchEvent(new win.MessageEvent('message',
-      { data: { ctRes: 1, id: msg.id, ok: true, fen: log.fen }, source: win })), 0);
+    if (msg.ctReq) {
+      log.ctx.push(!!msg.context);
+      return setTimeout(() => win.dispatchEvent(new win.MessageEvent('message',
+        { data: { ctRes: 1, id: msg.id, ok: true, fen: log.fen, history: log.history, headers: log.headers }, source: win })), 0);
+    }
     if (msg.ctMoveReq) {
       const san = { e2e4: 'e4', d2d4: 'd4', g1f3: 'Nf3', b1c3: 'Nc3', a1a2: 'Ra2' }[msg.uci] || null;
       log.moves.push(msg.uci);
+      if (log.onMove) log.onMove(msg.uci);
       return setTimeout(() => win.dispatchEvent(new win.MessageEvent('message', {
         data: { ctMoveRes: 1, id: msg.id, ok: true, san, reason: null }, source: win
-      })), 0);
+      })), log.moveReplyMs || 0);
     }
     return realPost(msg, o);
   };
 
+  win.eval(fs.readFileSync(path.join(ROOT, 'game.js'), 'utf8'));     // same order as manifest.json
   win.eval(fs.readFileSync(path.join(ROOT, 'lib.js'), 'utf8'));
   // a deterministic deviation roll: the tests need to know which candidate a low level will pick
   if (settings && settings.__rand !== undefined) win.Math.random = () => settings.__rand;
@@ -192,17 +231,53 @@ async function boot(settings, plan, opts) {
     return true;
   };
   win.eval(fs.readFileSync(path.join(ROOT, 'content.js'), 'utf8'));
-  if (!opts.native && !await until(() => win.__handshake())) throw new Error('the engine iframe never appeared');
-  if (!await until(() => /confirmed|Native backend connected/.test(doc.querySelector('#ct-verify').textContent))) {
+  if (!opts.native && !opts.connect && !await until(() => win.__handshake())) throw new Error('the engine iframe never appeared');
+  if (!await until(() => /confirmed|Native backend connected/.test(doc.querySelector('#ct-verify').textContent), opts.connect ? 60000 : 4000)) {
     throw new Error('engine never became ready: ' + doc.querySelector('#ct-status').textContent);
   }
   return {
-    win, doc, log, engine, plan: planState,
+    win, doc, log, engine, plan: planState, context: () => doc.querySelector('#ct-context').textContent,
     frameWin: () => seenWin,               // the sandbox the engine runs in, as the panel sees it
     status: () => doc.querySelector('#ct-status').textContent,
     goCount: () => log.go.length,
     lastGo: () => log.go[log.go.length - 1]
   };
+}
+
+/* native/host.py with a real engine, wrapped as a chrome.runtime Port (Chrome's 4-byte length framing). */
+function realHost(enginePath) {
+  const os = require('os'), { spawn } = require('child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-host-'));
+  fs.copyFileSync(path.join(ROOT, 'native/host.py'), path.join(dir, 'host.py'));
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ engine: enginePath, threads: 1, hash_mb: 16, ponder: true }));
+  const procs = [], sent = [], lines = [];
+  const connect = () => {
+    const proc = spawn('python3', [path.join(dir, 'host.py')], { stdio: ['pipe', 'pipe', 'inherit'] });
+    procs.push(proc);
+    let buf = Buffer.alloc(0), listener = null, gone = null;
+    proc.stdout.on('data', d => {
+      buf = Buffer.concat([buf, d]);
+      while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32LE(0)) {
+        const n = buf.readUInt32LE(0), msg = JSON.parse(buf.slice(4, 4 + n).toString());
+        buf = buf.slice(4 + n);
+        if (msg.line) lines.push(msg.line);
+        if (listener) listener(msg);
+      }
+    });
+    proc.on('exit', () => { if (gone) gone(); });
+    return {
+      onMessage: { addListener(fn) { listener = fn; } },
+      onDisconnect: { addListener(fn) { gone = fn; } },
+      postMessage(m) {
+        sent.push(m.command);
+        const body = Buffer.from(JSON.stringify(m)), head = Buffer.alloc(4);
+        head.writeUInt32LE(body.length);
+        proc.stdin.write(Buffer.concat([head, body]));
+      },
+      disconnect() { proc.kill(); }
+    };
+  };
+  return { connect, sent, lines, kill() { procs.forEach(p => p.kill()); fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 
 const click = (win, node) => node.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
@@ -482,6 +557,216 @@ async function firstPlayedMove(t) {
     ok(/disconnected/.test(t.status()), 'native disconnect is visible');
     eq(doc.querySelectorAll('svg.ct-overlay g').length, 0, 'native disconnect clears stale arrows');
     win.close();
+  }
+
+
+  // ---------- 7b. full move history: the engine gets the start position plus every move ----------
+  {
+    const t = await boot({ elo: 1200, auto: false, autoplay: false, side: 'turn', open: true });
+    const { win, doc, log } = t;
+    const analyzeAt = async fen => {
+      setPosition(t, fen);
+      const n = log.searches.length;
+      click(win, doc.querySelector('#ct-analyze'));
+      return await until(() => log.searches.length > n && /Thought|first complete/.test(t.status()) ? log.searches[log.searches.length - 1].position : false);
+    };
+    let fen = START;
+    const line = ['g1f3', 'g8f6', 'f3g1', 'f6g8', 'g1f3', 'g8f6', 'f3g1'];
+    eq(await analyzeAt(fen), 'position startpos', 'the initial position is sent as startpos');
+    for (const m of line) { fen = G.playUci(fen, m); await analyzeAt(fen); }
+    eq(log.position, 'position startpos moves ' + line.join(' '), 'after the shuffle the engine sees every move (and so the repetitions)');
+    ok(/History: 7 plies from the start position \u00B7 repetition-aware/.test(t.context()), 'the panel says the history is complete: ' + t.context());
+    ok(log.ctx.length && log.ctx.every(Boolean), 'the bridge is asked for the board context');
+    // a takeback that is not one move away truncates, it does not restart
+    fen = G.playUci(fen, 'e7e5');
+    await analyzeAt(fen);
+    eq(log.position, 'position startpos moves ' + line.join(' ') + ' e7e5', 'a pawn move extends it');
+    await analyzeAt(G.playUci(G.playUci(START, 'g1f3'), 'g8f6'));
+    eq(log.position, 'position startpos moves g1f3 g8f6 f3g1 f6g8 g1f3 g8f6', 'stepping back lands on the latest occurrence of that position');
+    win.close();
+  }
+
+  // joining a game in progress: FEN only (and labelled so) until the board's own move list replays to the board
+  {
+    const midMoves = ['e2e4', 'e7e5', 'g1f3', 'b8c6', 'f1b5'];
+    const mid = midMoves.reduce((f, m) => G.playUci(f, m), START);
+    const t = await boot({ elo: 1200, auto: false, autoplay: false, side: 'turn', open: true }, null, { fen: mid });
+    const { win, doc, log } = t;
+    const analyzeNow = async () => {
+      const n = log.searches.length;
+      click(win, doc.querySelector('#ct-analyze'));
+      return await until(() => log.searches.length > n && /Thought|first complete/.test(t.status()) ? log.searches[log.searches.length - 1].position : false);
+    };
+    eq(await analyzeNow(), 'position fen ' + mid, 'no history known: the exact FEN, nothing invented');
+    ok(/repetitions before the first seen position unknown/.test(t.context()), 'and the panel says repetitions are unknown: ' + t.context());
+    log.history = { via: 'getHistorySANs', moves: ['e4', 'e5', 'Nf3', 'Nc6', 'Bc4'] };
+    eq(await analyzeNow(), 'position fen ' + mid, 'a move list that does not replay to the board is ignored');
+    log.history = { via: 'getHistorySANs', moves: ['e4', 'e5', 'Nf3', 'Nc6', 'Bb5'] };
+    eq(await analyzeNow(), 'position startpos moves ' + midMoves.join(' '), 'a verified board move list restores the full history');
+    ok(/board move list, verified by replay\) \u00B7 repetition-aware/.test(t.context()), 'labelled as verified: ' + t.context());
+    win.close();
+  }
+
+  // ---------- 7c. clock adapter: both clocks, running side, increment, measured reserve ----------
+  {
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w',
+      mateMode: 'maximum', open: true }, { depths: 3 },
+    { extraHtml: clocksHtml('3:00', '3:00', 'w'), headers: { TimeControl: '180+2' } });
+    const { log } = t;
+    const go = await until(() => log.go.find(g => /^go wtime/.test(g)));
+    const m = /^go wtime (\d+) btime (\d+) winc 2000 binc 2000$/.exec(go || '');
+    ok(m, 'readable clocks + PGN TimeControl -> Stockfish time management with the real increment: ' + go);
+    ok(m && +m[1] <= 180000 - 1500 && +m[1] > 180000 - 1500 - 400, 'own clock minus the 1.5 s unmeasured reserve (and the read age): ' + (m && m[1]));
+    eq(m && +m[2], 180000, 'the opponent clock is passed as read');
+    ok(await until(() => log.moves[0] === 'e2e4'), 'and the move is played');
+    ok(/Clock: Stockfish time manager, reserve 1500 ms \(latency not measured yet \+ display 1000 ms\) \u00B7 increment \+2s \(game TimeControl\)/.test(t.context()),
+      'the panel shows what the clock adapter decided: ' + t.context());
+    t.win.close();
+  }
+  {
+    // the page flags the wrong clock as running: uncertain -> explicit Think time fallback, no guessing
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w',
+      mateMode: 'maximum', open: true }, { depths: 3 }, { extraHtml: clocksHtml('3:00', '3:00', 'b'), headers: { TimeControl: '180+2' } });
+    eq(await until(() => t.log.go.find(g => g !== SELF_TEST_GO)), 'go movetime 2000', 'clock data contradicting the board falls back to Think time');
+    ok(/clock fallback: running clock \(b\) does not match the side to move/.test(t.context()), 'with the reason: ' + t.context());
+    t.win.close();
+  }
+  {
+    // no increment information anywhere: clocks are still used, increment is the conservative 0 - and says so
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w',
+      mateMode: 'maximum', open: true }, { depths: 3 }, { extraHtml: clocksHtml('1:00', '0:59', 'w') });
+    const go0 = await until(() => t.log.go.find(g => g !== SELF_TEST_GO));
+    ok(/^go wtime \d+ btime 59000 winc 0 binc 0$/.test(go0 || ''), 'unknown increment -> winc 0: ' + go0);
+    ok(/increment unknown \u2192 0 \(conservative\)/.test(t.context()), 'labelled: ' + t.context());
+    t.win.close();
+  }
+
+  // ---------- 7d. pondering on the web board (native host that allows it) ----------
+  {
+    const plan = { depths: 3, best: 'e2e4', ponder: 'e7e5', hostPonder: true, ponderOption: true };
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w', ponder: true,
+      mateMode: 'maximum', open: true }, plan,
+    { native: true, extraHtml: clocksHtml('3:00', '3:00', 'w'), headers: { TimeControl: '180+2' } });
+    const { log, doc } = t;
+    ok(doc.querySelector('#ct-ponder').checked, 'the ponder switch persists');
+    ok(await until(() => log.moves[0] === 'e2e4'), 'first move played');
+    const first = log.searches[0];
+    eq(first.position, 'position startpos', 'first search from the start position');
+    ok(/^go wtime \d+ btime 180000 winc 2000 binc 2000$/.test(first.go), 'clock-managed: ' + first.go);
+    ok(log.cmds.indexOf('setoption name Ponder value true') >= 0 &&
+      log.cmds.indexOf('setoption name Ponder value true') < log.cmds.indexOf(first.go), 'Ponder option set before the search starts');
+
+    // our move lands; the opponent's clock runs -> ponder the predicted reply e7e5
+    t.plan.best = 'g1f3'; t.plan.ponder = 'b8c6';
+    let fen = G.playUci(START, 'e2e4');
+    setPosition(t, fen); setClocks(t, '3:02', '3:00', 'b');
+    const ponder = await until(() => log.searches.find(x => /^go ponder/.test(x.go)));
+    eq(ponder && ponder.position, 'position startpos moves e2e4 e7e5', 'ponders the position after the predicted reply');
+    ok(ponder && /^go ponder wtime \d+ btime \d+ winc 2000 binc 2000$/.test(ponder.go), 'with real clocks: ' + (ponder && ponder.go));
+    ok(await until(() => /Ponder: pondering e5 \(predicted reply\)/.test(t.context())), 'the panel says it is pondering: ' + t.context());
+    const searchesBefore = log.searches.length;
+
+    // the predicted reply is played -> ponderhit, the same search continues and its move is played
+    fen = G.playUci(fen, 'e7e5');
+    setPosition(t, fen); setClocks(t, '3:02', '2:58', 'w');
+    ok(await until(() => log.cmds.includes('ponderhit')), 'ponderhit sent');
+    ok(await until(() => log.moves[1] === 'g1f3'), 'the continued search\'s move is played: ' + log.moves.join(','));
+    eq(log.searches.length, searchesBefore, 'no new search was needed');
+    ok(await until(() => /Auto-played Nf3 after ponderhit \(\d+\.\ds pondered on the opponent's time\)/.test(t.status())), 'status says ponderhit: ' + t.status());
+
+    // our second move lands; ponder b8c6 - but the opponent plays d7d6 -> stop, discard, search the real position
+    t.plan.best = 'f1c4'; t.plan.ponder = 'g8f6';
+    fen = G.playUci(fen, 'g1f3');
+    setPosition(t, fen); setClocks(t, '3:03', '2:58', 'b');
+    ok(await until(() => log.searches.filter(x => /^go ponder/.test(x.go)).length === 2), 'second ponder search started');
+    eq(log.position, 'position startpos moves e2e4 e7e5 g1f3 b8c6', 'on the predicted b8c6');
+    t.plan.best = 'b1c3'; t.plan.ponder = 'h7h6';
+    const stopsBefore = log.cmds.filter(c => c === 'stop').length;
+    fen = G.playUci(fen, 'd7d6');
+    setPosition(t, fen); setClocks(t, '3:03', '2:57', 'w');
+    ok(await until(() => log.cmds.filter(c => c === 'stop').length > stopsBefore), 'wrong reply: the ponder search is stopped');
+    const real = await until(() => log.searches.find(x => x.position === 'position startpos moves e2e4 e7e5 g1f3 d7d6'));
+    ok(real && /^go wtime/.test(real.go), 'and a fresh clock-managed search runs on the real position: ' + (real && real.go));
+    ok(await until(() => log.moves[2] === 'b1c3'), 'the fresh search\'s move is played, not the discarded ponder answer: ' + log.moves.join(','));
+    eq(log.cmds.filter(c => c === 'ponderhit').length, 1, 'no ponderhit for the wrong reply');
+    ok(!log.moves.includes('f1c4'), 'the discarded ponder bestmove is never played');
+    // switching auto-play off stops a running ponder search
+    t.plan.best = 'a2a3'; t.plan.ponder = 'a7a6';
+    fen = G.playUci(fen, 'b1c3');
+    setPosition(t, fen); setClocks(t, '3:04', '2:57', 'b');
+    ok(await until(() => log.searches.filter(x => /^go ponder/.test(x.go)).length === 3), 'third ponder started');
+    const stops = log.cmds.filter(c => c === 'stop').length;
+    setSwitch(t.win, doc.querySelector('#ct-autoplay'), false);
+    ok(await until(() => log.cmds.filter(c => c === 'stop').length > stops), 'auto-play off stops pondering');
+    t.win.close();
+  }
+  {
+    // the board shows our move BEFORE the bridge answers (chess.com updates synchronously inside game.move):
+    // the ponder plan and increment probe are armed before the move goes out, so pondering still starts
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w', ponder: true,
+      mateMode: 'maximum', open: true }, { depths: 3, best: 'd2d4', ponder: 'g8f6', hostPonder: true, ponderOption: true },
+    { native: true, extraHtml: clocksHtml('5:00', '5:00', 'w'), headers: { TimeControl: '300+0' } });
+    t.log.moveReplyMs = 80;                 // the bridge answer is slower than the board update
+    t.log.onMove = uci => { setPosition(t, G.playUci(START, uci)); setClocks(t, '5:00', '5:00', 'b'); t.log.onMove = null; };
+    const p = await until(() => t.log.searches.find(x => /^go ponder/.test(x.go)));
+    eq(p && p.position, 'position startpos moves d2d4 g8f6', 'ponder starts even when the board moved before the bridge replied');
+    t.win.close();
+  }
+  {
+    // the native host did not opt in (--allow-ponder): never ponders, and says why
+    const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w', ponder: true,
+      mateMode: 'maximum', open: true }, { depths: 3, best: 'e2e4', ponder: 'e7e5', hostPonder: false, ponderOption: true },
+    { native: true, extraHtml: clocksHtml('3:00', '3:00', 'w'), headers: { TimeControl: '180+2' } });
+    ok(await until(() => t.log.moves[0] === 'e2e4'), 'move played');
+    setPosition(t, G.playUci(START, 'e2e4')); setClocks(t, '3:02', '3:00', 'b');
+    ok(await until(() => /not pondering: native host does not allow it/.test(t.context())), 'reason shown: ' + t.context());
+    ok(!t.log.go.some(g => /ponder/.test(g)) && !t.log.cmds.includes('setoption name Ponder value true'), 'no ponder search, Ponder option never enabled');
+    t.win.close();
+  }
+
+  // ---------- 7e. (optional) end to end with a REAL Stockfish behind the real native host ----------
+  // CT_STOCKFISH=/path/to/stockfish node tests/panel-logic.test.js
+  if (process.env.CT_STOCKFISH) {
+    const real = realHost(process.env.CT_STOCKFISH);
+    try {
+      const t = await boot({ elo: 400, autoplayElo: 400, time: 2, auto: false, autoplay: true, side: 'w', ponder: true,
+        mateMode: 'maximum', open: true }, null,
+      { connect: real.connect, extraHtml: clocksHtml('1:00', '1:00', 'w'), headers: { TimeControl: '60+1' } });
+      const { log } = t;
+      const lastBest = () => real.lines.filter(l => l.startsWith('bestmove')).pop() || '';
+      const legalIn = (fen, m) => G.legalMoves(fen).includes(m);
+      const m1 = await until(() => log.moves[0], 30000);
+      ok(m1 && legalIn(START, m1), '[real] first move is legal: ' + m1);
+      ok(real.sent.some(c => /^go wtime \d+ btime 60000 winc 1000 binc 1000$/.test(c)), '[real] clock-managed search with increment');
+      const p1 = (lastBest().split(' ')[3]) || null;
+      let fen = G.playUci(START, m1);
+      setPosition(t, fen); setClocks(t, '1:00', '1:00', 'b');
+      ok(await until(() => real.sent.some(c => /^go ponder /.test(c)), 10000), '[real] pondering started on the predicted reply ' + p1);
+      ok(real.sent.includes('position startpos moves ' + m1 + ' ' + p1), '[real] ponder position = history + predicted reply');
+      await tick(300);
+      fen = G.playUci(fen, p1);
+      setPosition(t, fen); setClocks(t, '1:00', '0:59', 'w');
+      ok(await until(() => real.sent.includes('ponderhit'), 10000), '[real] predicted reply played -> ponderhit');
+      const m2 = await until(() => log.moves[1], 30000);
+      ok(m2 && legalIn(fen, m2), '[real] the continued search plays a legal move: ' + m2);
+      const p2 = (lastBest().split(' ')[3]) || null;
+      fen = G.playUci(fen, m2);
+      setPosition(t, fen); setClocks(t, '1:00', '0:59', 'b');
+      ok(await until(() => real.sent.filter(c => /^go ponder /.test(c)).length === 2, 10000), '[real] second ponder on ' + p2);
+      await tick(300);
+      const other = G.legalMoves(fen).find(m => m !== p2);
+      const stops = real.sent.filter(c => c === 'stop').length;
+      fen = G.playUci(fen, other);
+      const histCmd = 'position startpos moves ' + [m1, p1, m2, other].join(' ');
+      setPosition(t, fen); setClocks(t, '1:00', '0:58', 'w');
+      ok(await until(() => real.sent.filter(c => c === 'stop').length > stops, 10000), '[real] unexpected reply ' + other + ' -> stop');
+      ok(await until(() => real.sent.includes(histCmd), 10000), '[real] fresh search on the real history: ' + histCmd);
+      const m3 = await until(() => log.moves[2], 30000);
+      ok(m3 && legalIn(fen, m3), '[real] and its move is legal in the real position: ' + m3);
+      eq(real.sent.filter(c => c === 'ponderhit').length, 1, '[real] exactly one ponderhit');
+      console.log('  real engine: ' + [m1, p1, m2, other, m3].join(' ') + ' | ' + t.context().replace(/\n/g, ' | '));
+      t.win.close();
+    } finally { real.kill(); }
   }
 
   // ---------- 8. the engine cache survives the redirect at the end of a match ----------
