@@ -4,6 +4,8 @@
   window.__chessTutorLoaded = true;
   const L = window.CTLib, G = window.CTGame;
   if (!L || !G) { console.warn('Chess Tutor: lib.js / game.js did not load'); return; }
+  // Troll mode is optional: if troll.js / troll-ui.js are missing the tutor keeps working exactly as before.
+  const T = window.CTTroll || null, TU = window.CTTrollUI || null;
 
   // ---------- Config ----------
   // The ELO presets are the strength target: the depth the answer is read from. They are not a search cap -
@@ -36,7 +38,27 @@
     autoplay: false, autoplayElo: 3200, mateMode: 'shortest', huntRisk: 'very', mistakes: true,
     // ponder = search the predicted reply on the opponent's time (Maximum Strength + native host that allows it).
     // Off by default: whether pondering is permitted is a rule of the match, not something the tutor can see.
-    ponder: false
+    ponder: false,
+    // ---------- Troll mode ----------
+    // A joke layer on top of the engine. Nothing below changes what the engine is ASKED; directives and rage
+    // tactics only choose which legal move to play afterwards. Off by default, and the whole section is hidden
+    // until the master switch is turned on. Taunts render inside this panel only - nothing is ever sent to the
+    // page, to chat, or to another player.
+    troll: false,
+    trollDirective: 'off',        // 'off' | 'chaos' | a directive id
+    trollSincerity: 'best',       // best / worst / random, within whatever the rule allows
+    trollChaosMode: false,
+    trollChaosEvery: 5,
+    trollRage: false,
+    trollRageTactic: 'auto',
+    trollRageEval: 250,           // centipawns, our point of view
+    trollRageClock: 0,            // required clock lead in seconds (0 = at least as much time as they have)
+    trollPreview: true,           // directives/rage also drive the arrows and "What would X play?"
+    // pranks
+    trollSound: true, trollVoice: false, trollGaslight: true, trollRunaway: true, trollLoading: true,
+    trollConfidence: true, trollMirror: true, trollSwap: true, trollJudge: true, trollTelem: true,
+    // commentary
+    trollCommentary: 'off', trollSarcastic: true, trollShame: true
   };
   const S = Object.assign({}, DEFAULTS);
   const DEPTH_INF = 40;            // slider maximum = no strength cap: play the deepest line
@@ -116,6 +138,26 @@
     // the same no-added-delay behavior, rather than silently retaining a stored wait.
     delete S.speed;
     delete S.dock; delete S.tucked; delete S.autoTuck;   // 1.1 tuck state: replaced by free dragging
+    if (T) sanitizeTroll();
+  }
+  // Troll settings are clamped the same way as everything else, so a corrupted stored value can never leave a
+  // half-configured joke running. An unknown directive id falls back to 'off' rather than to a random rule.
+  function sanitizeTroll() {
+    S.troll = S.troll === true;
+    S.trollDirective = (S.trollDirective === 'off' || S.trollDirective === 'chaos' ||
+      (T.DIRECTIVE_BY_ID[S.trollDirective] ? true : false)) ? S.trollDirective : 'off';
+    S.trollSincerity = ['best', 'worst', 'random'].includes(S.trollSincerity) ? S.trollSincerity : 'best';
+    S.trollChaosMode = S.trollChaosMode === true;
+    S.trollChaosEvery = Math.round(clamp(S.trollChaosEvery, 2, 20, 5));
+    S.trollRage = S.trollRage === true;
+    S.trollRageTactic = (S.trollRageTactic === 'auto' || T.RAGE_BY_ID[S.trollRageTactic]) ? S.trollRageTactic : 'auto';
+    S.trollRageEval = Math.round(clamp(S.trollRageEval, 100, 900, 250));
+    S.trollRageClock = Math.round(clamp(S.trollRageClock, 0, 60, 0));
+    S.trollPreview = S.trollPreview !== false;
+    S.trollCommentary = ['off', 'commentator', 'grandpa', 'armchair'].includes(S.trollCommentary) ? S.trollCommentary : 'off';
+    ['trollSound', 'trollGaslight', 'trollRunaway', 'trollLoading', 'trollConfidence', 'trollMirror',
+      'trollSwap', 'trollJudge', 'trollTelem', 'trollSarcastic', 'trollShame'].forEach(k => { S[k] = S[k] !== false; });
+    S.trollVoice = S.trollVoice === true;    // opt-in only: it talks out loud
   }
   function loadSettings() {
     return new Promise(res => {
@@ -764,7 +806,16 @@
     if (engine.nativeFallback) bits.push('Native unavailable: ' + engine.nativeFallback + ' — browser fallback, no local Syzygy');
     el.engdetail.textContent = bits.filter(Boolean).join(' \u00B7 ');
   }
+  /* updateTip writes the normal, useful explanation. With Judgmental tips on, the roast replaces it: the
+     point of the feature is that the panel stops explaining and starts commenting. */
   function updateTip() {
+    updateTipBase();
+    if (!trollOn() || !T || !S.trollJudge) return;
+    const cp = ourCpOf(lastResult);
+    const roast = trollJudge(cp);
+    if (roast) el.tip.textContent = roast;
+  }
+  function updateTipBase() {
     if (maximumOn()) {
       el.tip.textContent = 'Maximum Strength: uncapped search, one principal variation, no mistakes or speculative sacrifices. ' +
         'The engine gets the start position plus every move (repetition-aware). During auto-play both clocks, the running side and the increment ' +
@@ -865,8 +916,10 @@
     }
     if (!engine.ready) { setStatus('Engine loading...'); return; }
     const t0 = Date.now();
+    // Troll timing is decided BEFORE the search: the pick that asked for it only happens once it has answered.
+    trollThinkKind = trollPlanThink(pos);
     // ponderhit keeps the time limits the ponder search was started with (our clock has not moved since)
-    let lim = hit ? Object.assign({}, engine.cur.lim, { ponder: false }) : limits(pos);
+    let lim = hit ? Object.assign({}, engine.cur.lim, { ponder: false }) : trollLimits(pos);
     if (maximumOn()) {
       clockNote = lim.clockNote || '';
       if (!hit) engine.wantOption('Ponder', ponderGateFor(pos, lim).ok ? 'true' : 'false');
@@ -906,15 +959,34 @@
     // Show an intentional style choice as the headline/first arrow: the hunter's pressure pick, or a proven
     // shortest mate. Keep only same-depth alternatives so arrows do not mix evaluations from different iterations.
     // Without a deliberate choice, keep the regular search line visible (including any Natural-mistake model).
-    const shown = displayPick
+    const shownRaw = displayPick
       ? [displayPick.line].concat(displayPool.filter(l => l.move !== displayPick.uci && l.depth === displayPick.line.depth))
       : r.lines;
+    // A directive or the Rage Brain owns the headline arrow when it is driving, so the board preview shows
+    // the move that is about to be played rather than the move the engine would have preferred.
+    const shown = trollPreviewLines(pos, pool, shownRaw);
     lastResult = { fen: pos.fen, cmd: pos.cmd, lines: shown, choiceLines: pool, turn: pos.turn, mateLines: mateLines };
     const top = shown[0];
+    // A UCI score is already from the mover's point of view, and this runs only when it is our turn.
+    const ourCp = top.type === 'mate' ? (top.score > 0 ? 100000 : -100000) : (top.score || 0);
     el.best.textContent = L.uciToSan(top.move, pos.fen); el.best.title = top.move;
-    el.eval.textContent = L.evalText(top, pos.turn);
+    el.eval.textContent = trollSarcastic(L.evalText(top, pos.turn), ourCp);
     setBar(top, pos.turn);
     el.elotxt.textContent = '-';
+    if (trollUI) {
+      trollUI.showConfidence(ourCp);
+      // The soundboard judges OUR last move here, because this is the first moment its result is visible:
+      // the opponent has replied and the position has been searched again.
+      if (evalBeforeOurMove != null) {
+        const swing = ourCp - evalBeforeOurMove;
+        evalBeforeOurMove = null;
+        if (swing <= -900) trollUI.onHang();
+        else if (swing <= -300) trollUI.onBlunder();
+        else if (swing >= 300) trollUI.onBrilliant();
+      }
+      if (top.type === 'mate' && ourCp > 0) trollUI.onMate();
+      else if (ourCp <= -9000) trollUI.onLoss();
+    }
     const spentMs = Date.now() - t0;
     let msg = (r.pondered ? 'Ponderhit · ' : '') + 'Thought ' + (spentMs / 1000).toFixed(2) + 's · played from depth ' + top.depth +
       (lim.playDepth ? '/' + lim.playDepth : '') +
@@ -939,6 +1011,10 @@
       if (lim.timeMs > 0 && spentMs < lim.timeMs * 0.9 && !r.pondered) msg += ' (nothing left to think about here)';
     }
     if (maximumOn()) msg += lim.clocks ? ' · clock-managed' : ' · Think time (clock fallback)';
+    if (lim.trollThink) msg += ' · troll timing (' + lim.trollThink + ')';
+    if (lastTrollNote) msg += ' · ' + lastTrollNote;
+    const quip = trollCommentaryFor(pos, top.move, ourCp);
+    if (quip) el.tip.textContent = quip;
     setStatus(msg);
     showContext();
     render();
@@ -959,7 +1035,7 @@
     if (!plan || plan.base !== pos.cmd) return;
     ponderPlan = null;
     if (!plan.move) { ponderNote = 'no predicted reply from the engine'; showContext(); return; }
-    const lim = limits(pos, { ponder: true });
+    const lim = trollLimits(pos, { ponder: true });
     const gate = ponderGateFor(pos, lim);
     if (!gate.ok) { ponderNote = 'not pondering: ' + gate.reason; showContext(); return; }
     const cmd = G.positionCommand(pos.history, [plan.move]);
@@ -982,6 +1058,380 @@
       rows.push('Ponder: ' + (S.ponder ? (ponderNote || 'enabled - waits for our move and a predicted reply') : 'off'));
     }
     el.context.textContent = rows.join('\n');
+  }
+
+  // ===================================================================================
+  //  Troll mode
+  //  A joke layer on top of the engine. Two rules govern everything below:
+  //    1. Nothing here changes what the engine is ASKED. Directives and rage tactics only choose which of the
+  //       legal moves to play after the search has answered. The analysis path is untouched.
+  //    2. Every taunt, index and fake number is rendered in this panel. Nothing is written to the page, sent
+  //       to chat, or shown to another player.
+  // ===================================================================================
+  let trollUI = null;                 // the DOM/audio half, installed once the panel exists
+  let directiveState = {};            // per-directive memory (monorail file, queen's tour quadrant, ...)
+  let rageState = {};                 // the Rage Brain's memory (last tactic, carousel cycle)
+  let currentDirective = null;        // what chaos mode is currently running
+  let chaosPlays = 0;
+  let trollThinkKind = null;          // think-time override for the next search: 'instant' | 'max' | 'oscillate'
+  let lastRageThink = null;           // rage timing applies from the move after the tactic is chosen
+  let lastTrollNote = '';             // what the panel says about the last troll choice
+  let trollMemo = { key: null, pick: null };
+  let lastFenSeen = null, lastMoveAt = 0;
+  let evalBeforeOurMove = null;       // for the blunder/applause swing
+  let pendingTrade = false;
+  let lastOppUci = null;
+
+  const trollOn = () => !!(T && S.troll);
+  const dirState = id => (directiveState[id] = directiveState[id] || {});
+
+  function randomDirectiveId() {
+    if (!T) return null;
+    const all = T.DIRECTIVES.filter(d => d.id !== 'time-troll' || true);
+    return all[Math.floor(Math.random() * all.length)].id;
+  }
+  // Chaos mode rotates the rule every N moves, so a game under it never settles into one joke.
+  function activeDirectiveId() {
+    if (!trollOn()) return null;
+    if (S.trollDirective === 'off') return null;
+    const chaos = S.trollDirective === 'chaos' || S.trollChaosMode;
+    if (chaos) {
+      const every = Math.max(2, S.trollChaosEvery || 5);
+      if (!currentDirective || chaosPlays >= every) {
+        currentDirective = randomDirectiveId();
+        chaosPlays = 0;
+        directiveState = {};
+      }
+      return currentDirective;
+    }
+    return S.trollDirective;
+  }
+  function resetDirective() {
+    currentDirective = null; chaosPlays = 0; directiveState = {}; rageState = {};
+    trollMemo = { key: null, pick: null };
+  }
+
+  // The <details> header says whether troll mode is live and which rule is running, so it is never a mystery.
+  function syncTrollSummary() {
+    if (!el.trollSummary) return;
+    if (!S.troll) { el.trollSummary.textContent = 'Troll mode (off)'; return; }
+    const id = activeDirectiveId();
+    const d = id && T ? T.DIRECTIVE_BY_ID[id] : null;
+    el.trollSummary.textContent = 'Troll mode (on)' + (d ? ' \\u00B7 ' + d.name : S.trollRage ? ' \\u00B7 Rage Brain' : '');
+  }
+
+  /* Panel wiring. The directive menu is built from the registry in troll.js rather than written out in HTML,
+     so the menu can never drift away from the code that implements it. */
+  function wireTroll() {
+    if (!T || !TU || !el.troll) return;
+    if (el.trollDir) {
+      el.trollDir.innerHTML = '';
+      const opt = (v, txt, title) => { const o = document.createElement('option'); o.value = v; o.textContent = txt; if (title) o.title = title; return o; };
+      el.trollDir.appendChild(opt('off', 'Off (no directive)'));
+      el.trollDir.appendChild(opt('chaos', 'Chaos mode (rotate randomly)'));
+      T.DIRECTIVE_GROUPS.forEach(g => {
+        const og = document.createElement('optgroup'); og.label = g.name;
+        T.DIRECTIVES.filter(d => d.group === g.id).forEach(d => og.appendChild(opt(d.id, d.name, d.blurb)));
+        if (og.children.length) el.trollDir.appendChild(og);
+      });
+    }
+    if (el.trollTactic) {
+      el.trollTactic.innerHTML = '';
+      const o = document.createElement('option'); o.value = 'auto'; o.textContent = 'Auto (picks for the moment)';
+      el.trollTactic.appendChild(o);
+      T.RAGE_GROUPS.forEach(g => {
+        const og = document.createElement('optgroup'); og.label = g.name;
+        T.RAGE_TACTICS.filter(t => t.group === g.id).forEach(t => {
+          const n = document.createElement('option'); n.value = t.id; n.textContent = t.name; n.title = t.blurb;
+          og.appendChild(n);
+        });
+        if (og.children.length) el.trollTactic.appendChild(og);
+      });
+    }
+    trollUI = TU.install({
+      S: S, save: saveSettings, root: el.root, panel: el.panel, head: el.head,
+      status: el.status, tip: el.tip, evalEl: el.eval, bestEl: el.best,
+      engineEl: el.engine, verifyEl: el.verify, viewport: viewport,
+      say: setStatus, rand: Math.random,
+      els: {
+        troll: el.troll, trollBody: el.trollBody, trollDir: el.trollDir, trollSincerity: el.trollSincerity,
+        trollChaos: el.trollChaos, trollRage: el.trollRage, trollTactic: el.trollTactic,
+        trollEval: el.trollEval, trollEvalVal: el.trollEvalVal, trollClock: el.trollClock,
+        trollClockVal: el.trollClockVal, trollPreview: el.trollPreview, trollCommentary: el.trollCommentary,
+        trollSarcastic: el.trollSarcastic, trollShame: el.trollShame, trollSound: el.trollSound,
+        trollVoice: el.trollVoice, trollGaslight: el.trollGaslight, trollRunaway: el.trollRunaway,
+        trollLoading: el.trollLoading, trollConfidence: el.trollConfidence, trollMirror: el.trollMirror,
+        trollSwap: el.trollSwap, trollJudge: el.trollJudge, trollTelem: el.trollTelem,
+        dirRow: el.dirRow, rageRow: el.rageRow, bug: el.bug,
+        confidenceRow: el.confidenceRow, confidence: el.confidence, telem: el.telem,
+        frustRow: el.frustRow, frustFill: el.frustFill, frustVal: el.frustVal,
+        analyze: el.analyze, close: el.close, engine: el.engine
+      }
+    });
+
+    const save2 = () => { saveSettings(); if (trollUI) trollUI.sync(); syncTrollSummary(); };
+    const refresh = () => { lastResult = null; lastEloMove = null; analyze(); };
+
+    if (el.troll) el.troll.addEventListener('change', () => {
+      S.troll = el.troll.checked;
+      if (!S.troll) { resetDirective(); lastTrollNote = ''; trollThinkKind = null; lastRageThink = null; }
+      sanitizeTroll(); save2(); render(); refresh();
+    });
+    if (el.trollDir) el.trollDir.addEventListener('change', () => {
+      S.trollDirective = el.trollDir.value; sanitizeTroll(); resetDirective(); save2(); render(); refresh();
+    });
+    if (el.trollSincerity) el.trollSincerity.addEventListener('change', () => {
+      S.trollSincerity = el.trollSincerity.value; sanitizeTroll(); save2();
+    });
+    if (el.trollChaosMode) el.trollChaosMode.addEventListener('change', () => {
+      S.trollChaosMode = el.trollChaosMode.checked;
+      if (el.chaosRow) el.chaosRow.style.display = S.trollChaosMode ? '' : 'none';
+      resetDirective(); sanitizeTroll(); save2();
+    });
+    if (el.trollChaos) el.trollChaos.addEventListener('input', () => {
+      S.trollChaosEvery = +el.trollChaos.value;
+      if (el.trollChaosVal) el.trollChaosVal.textContent = S.trollChaosEvery;
+    });
+    if (el.trollChaos) el.trollChaos.addEventListener('change', () => { sanitizeTroll(); save2(); });
+    if (el.trollRage) el.trollRage.addEventListener('change', () => {
+      S.trollRage = el.trollRage.checked; resetDirective(); sanitizeTroll(); save2(); refresh();
+    });
+    if (el.trollTactic) el.trollTactic.addEventListener('change', () => {
+      S.trollRageTactic = el.trollTactic.value; sanitizeTroll(); save2();
+    });
+    if (el.trollEval) {
+      el.trollEval.addEventListener('input', () => {
+        S.trollRageEval = +el.trollEval.value;
+        if (el.trollEvalVal) el.trollEvalVal.textContent = '+' + (S.trollRageEval / 100).toFixed(1);
+      });
+      el.trollEval.addEventListener('change', () => { sanitizeTroll(); save2(); });
+    }
+    if (el.trollClock) {
+      el.trollClock.addEventListener('input', () => {
+        S.trollRageClock = +el.trollClock.value;
+        if (el.trollClockVal) el.trollClockVal.textContent = S.trollRageClock + 's';
+      });
+      el.trollClock.addEventListener('change', () => { sanitizeTroll(); save2(); });
+    }
+    if (el.trollCommentary) el.trollCommentary.addEventListener('change', () => {
+      S.trollCommentary = el.trollCommentary.value; sanitizeTroll(); save2(); refresh();
+    });
+    const bools = {
+      trollPreview: 'trollPreview', trollSarcastic: 'trollSarcastic', trollShame: 'trollShame',
+      trollSound: 'trollSound', trollVoice: 'trollVoice', trollGaslight: 'trollGaslight',
+      trollRunaway: 'trollRunaway', trollLoading: 'trollLoading', trollConfidence: 'trollConfidence',
+      trollMirror: 'trollMirror', trollSwap: 'trollSwap', trollJudge: 'trollJudge', trollTelem: 'trollTelem'
+    };
+    Object.keys(bools).forEach(nodeKey => {
+      const node = el[nodeKey];
+      if (!node) return;
+      node.addEventListener('change', () => {
+        S[bools[nodeKey]] = node.checked;
+        sanitizeTroll(); save2(); render();
+      });
+    });
+    if (trollUI) { trollUI.sync(); trollUI.armButtonSwap(); }
+    syncTrollSummary();
+    if (el.chaosRow) el.chaosRow.style.display = S.trollChaosMode ? '' : 'none';
+  }
+
+  /* Our evaluation in centipawns from OUR point of view, and whether it is a mate for us. `lines` lets a
+     caller pass the search that just finished instead of the previous one, so the Rage Brain always gates on
+     the position it is about to move in rather than on the one before it.
+
+     No sign flip is needed: a UCI score is already stated from the point of view of the side to move, and
+     every caller here only runs when it is genuinely our turn. Converting to "white's point of view" first
+     (the usual `score * (turn === 'w' ? 1 : -1)`) would be correct for the bar but wrong for the gate, which
+     has to know whether WE are the ones winning. */
+  function ourEval(pos, lines) {
+    const src = (lines && lines.length) ? lines : (lastResult ? lastResult.lines : null);
+    if (!src || !src.length) return { cp: null, mate: false };
+    const top = src[0];
+    if (top.type === 'mate') { const m = top.score || 0; return { cp: m > 0 ? 100000 : -100000, mate: m > 0 }; }
+    return { cp: top.score || 0, mate: false };
+  }
+  // Both clocks, from the point of view of the side the tutor plays.
+  function clockPair(pos) {
+    const c = readClocks();
+    if (!c || c.error) return { myClockMs: null, oppClockMs: null };
+    const us = sideForPosition(pos);
+    return { myClockMs: us === 'w' ? c.white : c.black, oppClockMs: us === 'w' ? c.black : c.white };
+  }
+
+  /* The move a directive or the Rage Brain wants, or null when neither is active (or when the rule has
+     nothing legal to do and the engine should just play). Rage is tried first because it is conditional: it
+     only fires when you are winning AND have the time to be annoying with.
+
+     The result is memoised per position: the board preview and the auto-play move are asked for in the same
+     cycle, and asking twice would advance every stateful rule (the chaos rotation, blunder chicken's ratchet)
+     by two moves instead of one. */
+  function trollPickFor(pos, lines, preview) {
+    if (!trollOn() || !T) return null;
+    if (preview === true && !S.trollPreview) return null;   // preview follows its own switch; auto-play does not
+    const k = keyOf(pos);
+    if (trollMemo.key === k) return trollMemo.pick;
+    const useLines = lines && lines.length ? lines : (lastResult ? lastResult.lines : []);
+    const id = activeDirectiveId();
+    const state = id ? dirState(id) : {};
+    const ctx = T.makeContext(pos.fen, { lines: useLines, state: state, oppLastUci: lastOppUci, rand: Math.random });
+    if (!ctx || !ctx.moves.length) return null;
+
+    if (S.trollRage) {
+      const ev = ourEval(pos, useLines), cl = clockPair(pos);
+      const ply = pos.history && pos.history.plies != null ? pos.history.plies : null;
+      const s = {
+        score: ev.cp, mate: ev.mate, myClockMs: cl.myClockMs, oppClockMs: cl.oppClockMs, ply: ply,
+        tactic: S.trollRageTactic, state: rageState,
+        cfg: { evalThreshold: S.trollRageEval, clockMargin: (S.trollRageClock || 0) * 1000 }
+      };
+      const r = T.ragePick(ctx, s);
+      if (trollUI) trollUI.setGateReason(r && r.gate ? r.gate.reason : '');
+      // A timing override is only earned by a gate that is actually open: if the gate shut again, the search
+      // window goes back to normal from the next move instead of lingering.
+      if (!r || !r.on) lastRageThink = null;
+      if (r && r.on && r.uci) {
+        lastRageThink = r.think || null;
+        chaosPlays++;
+        return memo(k, {
+          uci: r.uci, name: r.name, kind: 'rage', suspended: !!r.suspended, blurb: r.blurb,
+          note: trollUI ? trollUI.rageNote(r) : r.name, think: r.think || null
+        });
+      }
+    }
+    if (id) {
+      const p = T.pickDirective(id, ctx, { sincerity: S.trollSincerity });
+      if (p && p.uci) {
+        chaosPlays++;
+        return memo(k, {
+          uci: p.uci, name: p.name, kind: 'directive', suspended: !!p.suspended, blurb: p.blurb,
+          note: trollUI ? trollUI.directiveNote(p) : p.name, think: T.directiveThink(id)
+        });
+      }
+    }
+    return memo(k, null);
+  }
+  function memo(k, pick) { trollMemo = { key: k, pick: pick }; return pick; }
+
+  // The think-time override for the next search, decided before the search starts (the pick itself comes after).
+  function trollPlanThink(pos) {
+    if (!trollOn() || !T) return null;
+    const id = activeDirectiveId();
+    if (id) return T.directiveThink(id);
+    if (S.trollRage && lastRageThink) return lastRageThink;
+    return null;
+  }
+  /* Wrap the normal search limits with a troll timing. Maximum Strength normally hands both clocks to
+     Stockfish's own time manager; a deliberate timing is not a time-management decision, so the override
+     drops the clock budget and says so in the clock note rather than quietly pretending it is one. */
+  function trollLimits(pos, opts) {
+    const lim = limits(pos, opts);
+    if (!trollOn() || !T || !trollThinkKind) return lim;
+    const ply = pos && pos.history && pos.history.plies != null ? pos.history.plies : null;
+    const ms = T.thinkMs(trollThinkKind, (S.time || 0) * 1000, ply);
+    if (ms == null) return lim;
+    if (lim.clocks) { delete lim.clocks; lim.clockOk = false; }
+    lim.timeMs = ms;
+    lim.eager = ms <= 150;
+    lim.trollThink = trollThinkKind;
+    lim.clockNote = (lim.clockNote ? lim.clockNote + ' \\u00B7 ' : '') + 'troll timing (' + trollThinkKind + ')';
+    return lim;
+  }
+
+  /* Reorder the arrows so the first one is the move the directive/rage would actually play, so the preview
+     on the board is honest about what is about to happen. Only same-depth alternatives follow it, exactly
+     like the hunter's deliberate pick does. */
+  function trollPreviewLines(pos, lines, shown) {
+    if (!trollOn() || !S.trollPreview || !shown || shown.length < 2) return shown;
+    const p = trollPickFor(pos, lines, true);
+    if (!p) return shown;
+    lastTrollNote = p.note || p.name;
+    const hit = shown.filter(l => l.move === p.uci);
+    if (!hit.length) return shown;
+    const rest = shown.filter(l => l.move !== p.uci && l.depth === hit[0].depth);
+    return hit.concat(rest);
+  }
+
+  // ---------- the panel's voice ----------
+  // The sarcastic eval replaces "+2.3" with "+2.3 (and yet, here we are)". Cosmetic: the number is unchanged.
+  function trollSarcastic(text, cp) {
+    if (!trollOn() || !T || !S.trollSarcastic) return text;
+    return T.COMMENTARY.sarcastic({ evalText: text, eval: cp || 0, rng: Math.random });
+  }
+  function trollCommentaryFor(pos, uci, cp) {
+    if (!trollOn() || !T || !trollUI || !S.trollCommentary || S.trollCommentary === 'off') return '';
+    const info = pos ? T.infoOf(uci, L.fenBoardMap(pos.fen)) : null;
+    const after = pos ? G.playUci(pos.fen, uci) : null;
+    return trollUI.commentaryFor({
+      san: pos ? L.uciToSan(uci, pos.fen) : uci,
+      piece: info ? info.type : '',
+      capture: !!(info && info.capture),
+      check: !!(after && G.inCheck(after)),
+      mate: !!(after && G.inCheck(after) && !(G.legalMoves(after) || []).length),
+      eval: cp || 0, evalText: pos && lastResult ? L.evalText(lastResult.lines[0], pos.turn) : '0.0',
+      rng: Math.random
+    });
+  }
+  function trollJudge(cp) {
+    if (!trollOn() || !T || !S.trollJudge || cp == null) return '';
+    return T.judgmentFor(cp, Math.random);
+  }
+  const ourCpOf = res => {
+    if (!res || !res.lines || !res.lines.length) return null;
+    const top = res.lines[0];
+    return top.type === 'mate' ? ((top.score || 0) > 0 ? 100000 : -100000) : (top.score || 0);
+  };
+
+  // ---------- telemetry: what the opponent has been allowed to do ----------
+  function pieceCount(st) { let n = 0; for (let i = 0; i < 64; i++) if (st.b[i]) n++; return n; }
+  function piecesInOurHalf(st, ourSide) {
+    let n = 0;
+    for (let i = 0; i < 64; i++) {
+      const p = st.b[i];
+      if (!p) continue;
+      const sq = 'abcdefgh'[i & 7] + ((i >> 3) + 1);
+      const adv = ourSide === 'w' ? (+sq[1]) : 9 - (+sq[1]);
+      const mine = p === p.toUpperCase() ? 'w' : 'b';
+      if (mine !== ourSide && adv <= 4) n++;
+    }
+    return n;
+  }
+  function notePositionChange(prevFen, pos, atMs) {
+    if (!trollOn() || !trollUI || !prevFen) { lastFenSeen = pos.fen; lastMoveAt = Date.now(); return; }
+    const prev = G.parseFen(prevFen), now = G.parseFen(pos.fen);
+    lastFenSeen = pos.fen;
+    lastMoveAt = Date.now();
+    if (!prev || !now) return;
+    const byUs = !ourTurn(pos);
+    // remember the opponent's move itself: Monkey see, monkey do mirrors it
+    if (!byUs) {
+      const cands = G.legalMoves(prevFen) || [];
+      for (let i = 0; i < cands.length; i++) {
+        if (G.playUci(prevFen, cands[i]) === pos.fen) { lastOppUci = cands[i]; break; }
+      }
+    }
+    const captured = pieceCount(now) < pieceCount(prev);
+    const check = !!G.inCheck(pos.fen);
+    const our = sideForPosition(pos);
+    const ctx = T ? T.makeContext(pos.fen, { lines: lastResult ? lastResult.lines : [] }) : null;
+    if (byUs) {
+      const gain = captured;
+      if (gain && pendingTrade) { trollUI.noteMove({ byUs: true, capture: true, trade: true, ctx: ctx }); pendingTrade = false; }
+      else trollUI.noteMove({ byUs: true, capture: gain, check: check, ctx: ctx });
+      // The swing our move caused is only visible once the reply is on the board, so remember the
+      // evaluation here and judge it in analyze() when the next position is searched.
+      evalBeforeOurMove = ourCpOf(lastResult);
+      return;
+    }
+    // the opponent just moved: this is where the eval swing of OUR last move becomes visible
+    const entries = piecesInOurHalf(now, our) - piecesInOurHalf(prev, our);
+    trollUI.noteMove({
+      byUs: false, capture: captured, check: check, entered: entries > 0, trade: false,
+      legalReplies: (G.legalMoves(pos.fen) || []).length,
+      moveMs: atMs ? Math.max(0, Date.now() - atMs) : null,
+      ctx: ctx
+    });
+    if (captured) pendingTrade = true;
+    trollUI.telemetry(ctx);
   }
 
   // ---------- Auto-play ----------
@@ -1027,6 +1477,18 @@
     if (!S.autoplay || playing || !engine || !engine.ready || !lines || lines.length < 1 || !ourTurn(pos)) return;
     const key = keyOf(pos);
     if (playAttempt && playAttempt.key === key && playAttempt.ok) return;      // already moved for this position
+    // Troll mode owns the move when it is on: a directive or the Rage Brain picks from the legal moves the
+    // engine has already produced, so the engine's answer stays what it is - only the choice changes.
+    const troll = trollPickFor(pos, lines, false);
+    if (troll) {
+      // The same stale-position guard as the normal path: the board is re-read and the move only goes out
+      // while it is still genuinely our turn in the position that was analysed.
+      const now = await readPosition();
+      if (!S.autoplay || !now || now.settling || keyOf(now) !== key || !ourTurn(now)) return;
+      lastTrollNote = troll.note || troll.name;
+      await tryPlay(now, troll.uci, { troll: troll });
+      return;
+    }
     const choice = pickForAutoplay(lines, pos.fen, mateLines);
     if (!choice) return;
     // Yield only to the board/FEN request needed for stale-move protection; the move itself goes straight out.
@@ -1050,6 +1512,13 @@
     const huntTraits = hunt && huntOn() && L.aggressionScore(hunt) ? L.huntNote(hunt) : '';
     const huntNote = !mateNote && huntTraits ? ' · hunter: ' + huntTraits : '';
     const slipNote = mistake ? ' · natural ' + autoplayLevelLabel() + ' ELO slip' : '';
+    // A troll choice says what it is, so an absurd move is explained instead of mysterious.
+    const tr = info && info.troll ? info.troll : null;
+    const trollNote = tr ? ' · ' + (tr.suspended ? 'DIRECTIVE SUSPENDED, playing a real move' : tr.name) : '';
+    if (tr) {
+      playAttempt.troll = { kind: tr.kind, name: tr.name, suspended: !!tr.suspended };
+      if (trollUI) trollUI.telemetry(T ? T.makeContext(pos.fen, { lines: [] }) : null);
+    }
     // Maximum Strength: note our clock right before the move (to measure the increment afterwards)
     const result = info && info.result, measure = maximumOn() && S.autoplay && prior === 0;
     const pre = measure ? readClocks() : null, side = pos.mover === 'w' ? 'white' : 'black';
@@ -1078,15 +1547,15 @@
       // an API move is confirmed by the board; a synthetic click is only reported once the board confirms it
       playAttempt.ok = !!res.confirmed;
       lastEloMove = uci; render();
-      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote + huntNote + slipNote;
+      el.elotxt.textContent = (res.san || san) + ' (auto-played at ' + labelForPlay() + ')' + mateNote + huntNote + slipNote + trollNote;
       const when = result && result.pondered ? ' after ponderhit (' + (result.pondered.ms / 1000).toFixed(1) + 's pondered on the opponent\'s time)'
         : result && result.clockManaged ? ' (clock-managed search)'
           : S.time > 0 ? ' after ' + fmtSecs(S.time) + ' of thinking' : ' instantly';
       setStatus(res.confirmed
-        ? 'Auto-played ' + (res.san || san) + when + mateNote + huntNote + slipNote
-        : 'Auto-play: sent ' + san + when + ' - waiting for the board to confirm it' + mateNote + huntNote + slipNote);
+        ? 'Auto-played ' + (res.san || san) + when + mateNote + huntNote + slipNote + trollNote
+        : 'Auto-play: sent ' + san + when + ' - waiting for the board to confirm it' + mateNote + huntNote + slipNote + trollNote);
     } else {
-      setStatus('Auto-play: ' + san + ' not played (' + res.reason + ')');
+      setStatus('Auto-play: ' + san + ' not played (' + res.reason + ')' + trollNote);
     }
     return res.ok;
   }
@@ -1125,7 +1594,7 @@
     let lines = base.choiceLines || base.lines;
     let mateLines = base.mateLines || [];
     if (!maximumOn() && lines.length < 3 && engine && engine.ready) {
-      const r = await engine.analyze(base.cmd || base.fen, limits(), mpvFor());
+      const r = await engine.analyze(base.cmd || base.fen, trollLimits(null), mpvFor());
       if (!lastResult || lastResult.fen !== base.fen) return;
       if (r && r.lines.length) {
         lines = r.deepLines && huntOn() ? L.huntPool(r.lines, r.deepLines) : r.lines;
@@ -1133,8 +1602,21 @@
       }
     }
     const eloForPick = S.custom ? 1200 : eloKey();
-    const pick = L.chooseMove(lines, pickOpts(base.fen, eloForPick, mateLines));
+    // With "Directives drive the preview" on, this button answers what the joke would actually play.
+    const pseudo = { fen: base.fen, turn: base.turn, mover: base.turn, me: base.turn };
+    const tr = trollPickFor(pseudo, lines, true);
+    const pick = tr
+      ? { uci: tr.uci, line: lines.filter(l => l.move === tr.uci)[0] || lines[0] }
+      : L.chooseMove(lines, pickOpts(base.fen, eloForPick, mateLines));
     if (!pick) return;
+    if (tr) {
+      lastTrollNote = tr.note || tr.name;
+      el.elotxt.textContent = L.uciToSan(pick.uci, base.fen) + ' \\u2014 ' +
+        (tr.suspended ? 'DIRECTIVE SUSPENDED: ' + tr.name + ' has no legal move here' : tr.name + ': ' + tr.blurb);
+      el.tip.textContent = tr.blurb + (tr.kind === 'rage' ? ' (Rage Brain)' : '');
+      render();
+      return;
+    }
     const best = lines.map(l => l.move)[0];
     lastEloMove = pick.uci;
     const san = L.uciToSan(pick.uci, base.fen), label = S.custom ? '1200' : levelLabel();
@@ -1203,6 +1685,7 @@
       if (maximumOn() && S.autoplay) sampleClocks();   // so a ticking clock can be recognised if the page has no marker
       const key = keyOf(pos);
       if (key !== lastKeySeen) {
+        notePositionChange(lastFenSeen, pos, lastMoveAt);
         lastKeySeen = key; lastResult = null; lastEloMove = null; clearOverlay();
         if (playAttempt && playAttempt.key !== key) playAttempt = null;   // that move landed (or the game moved on)
         el.fen.textContent = pos.fen;
@@ -1332,7 +1815,24 @@
       analyze: q('ct-analyze'), eloBtn: q('ct-elomove'), status: q('ct-status'), best: q('ct-bestmove'), eval: q('ct-eval'),
       engine: q('ct-engine'), verify: q('ct-verify'), engdetail: q('ct-engdetail'), barfill: q('ct-barfill'),
       elotxt: q('ct-elotxt'), tip: q('ct-tip'), fen: q('ct-fen'), context: q('ct-context'),
-      ponder: q('ct-ponder'), ponderRow: q('ct-ponderrow')
+      ponder: q('ct-ponder'), ponderRow: q('ct-ponderrow'),
+      // ---- troll mode ----
+      troll: q('ct-troll'), trollBody: q('ct-trollbody'), trollSummary: q('ct-trollsummary'),
+      trollDir: q('ct-trolldir'), trollSincerity: q('ct-trollsincerity'), dirRow: q('ct-dir-row'),
+      trollChaosMode: q('ct-trollchaosmode'), trollChaos: q('ct-trollchaos'),
+      trollChaosVal: q('ct-trollchaosval'), chaosRow: q('ct-chaos-row'),
+      trollRage: q('ct-trollrage'), rageRow: q('ct-trollragerow'), trollTactic: q('ct-trolltactic'),
+      trollEval: q('ct-trolleval'), trollEvalVal: q('ct-trollevalval'),
+      trollClock: q('ct-trollclock'), trollClockVal: q('ct-trollclockval'),
+      trollPreview: q('ct-trollpreview'), trollCommentary: q('ct-trollcommentary'),
+      trollSarcastic: q('ct-trollsarcastic'), trollShame: q('ct-trollshame'),
+      trollSound: q('ct-trollsound'), trollVoice: q('ct-trollvoice'), trollGaslight: q('ct-trollgaslight'),
+      trollRunaway: q('ct-trollrunaway'), trollLoading: q('ct-trollloading'),
+      trollConfidence: q('ct-trollconfidence'), trollMirror: q('ct-trollmirror'),
+      trollSwap: q('ct-trollswap'), trollJudge: q('ct-trolljudge'), trollTelem: q('ct-trolltelem'),
+      bug: q('ct-bug'),
+      confidenceRow: q('ct-confidence-row'), confidence: q('ct-confidence'),
+      telem: q('ct-telem'), frustRow: q('ct-frust-row'), frustFill: q('ct-frustfill'), frustVal: q('ct-frustval')
     };
     el.side.value = S.side;
     el.bestCb.checked = S.showBest; el.top3.checked = S.showTop3; el.auto.checked = S.auto;
@@ -1340,6 +1840,7 @@
     buildStrips();
     if (S.pos) placePanel(S.pos.x, S.pos.y);
     syncControls(); clampPanel();
+    wireTroll();
 
     const tap = (node, fn) => {   // click + touchend without double firing
       let touched = false;
@@ -1489,13 +1990,16 @@
       setStatus('Loading engine...');
       el.verify.className = 'warn'; el.verify.textContent = 'Checking engine...';
       engine = e;
+      if (trollUI) trollUI.bootTheater();     // loading theater: absurd sub-steps while the real download runs
       // ask for persistent storage once the panel is up, so Chrome keeps the engine instead of evicting it
       askPersistentStorage().then(p => { if (e.cachePersisted !== true) e.cachePersisted = p; showEngine(); }).catch(() => {});
       if (!e.ready) await e.init();
+      if (trollUI) trollUI.stopBootTheater();   // the real engine line replaces the jokes
       showEngine(); setStatus(e.nativeFallback ? 'Browser fallback: ' + e.nativeFallback : 'Ready');
       if (S.auto || S.autoplay) analyze();
     } catch (err) {
       engine = null;
+      if (trollUI) trollUI.stopBootTheater();
       el.verify.className = 'warn'; el.verify.textContent = '\u26A0 Engine failed to start';
       setStatus('Engine failed to start: ' + err.message + ' (press Analyze to retry)');
       try { e.frame && e.frame.remove(); } catch (_) {}

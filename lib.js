@@ -623,6 +623,7 @@
     reportDepth: reportDepth, chooseMove: chooseMove,
     goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES,
     pieceAttacks: pieceAttacks, attackedBy: attackedBy, sideInCheck: sideInCheck, applyMove: applyMove,
+    isHanging: isHanging, newlyHangingValue: newlyHangingValue, kingSquare: kingSquare, kingRing: kingRing,
     continuationPressure: continuationPressure, hangingValue: hangingValue, moveTraits: moveTraits, aggressionScore: aggressionScore, huntNote: huntNote,
     huntPool: huntPool, huntPick: huntPick, huntTolerance: huntTolerance, lineValue: lineValue,
     deeperLine: deeperLine, HUNT_RISK: HUNT_RISK };

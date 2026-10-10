@@ -17,6 +17,10 @@
       <span id="ct-eval">0.0</span>
     </div>
     <div id="ct-bar"><div id="ct-barfill"></div></div>
+    <div class="ct-field ct-fixed" id="ct-confidence-row" style="display:none">
+      <span class="ct-label" title="A completely fabricated number. It is high when the engine is winning and low when you are.">Confidence</span>
+      <span id="ct-confidence" class="ct-val">&mdash;</span>
+    </div>
 
     <div class="ct-field">
       <span class="ct-label" title="How strong the tutor plays/analyses. It sets which depth the move comes from - it does NOT shorten the think time.">Play level</span>
@@ -100,10 +104,88 @@
       <span id="ct-opacityval" class="ct-val">100%</span>
     </div>
 
+    <details id="ct-trollbox">
+      <summary id="ct-trollsummary">Troll mode (off)</summary>
+      <div id="ct-trollinner">
+        <label class="ct-switch" title="Everything below is a joke layer on top of the engine. It never touches the analysis path, and no taunt ever leaves this panel."><span>Troll mode</span><input type="checkbox" id="ct-troll"></label>
+        <div id="ct-trollbody" style="display:none">
+
+          <div class="ct-field">
+            <span class="ct-label" title="One dumb rule, played completely sincerely. It filters the legal moves down to the ones that obey, then plays the best of what is left.">Directive</span>
+            <select id="ct-trolldir" aria-label="Troll directive"></select>
+          </div>
+          <div class="ct-field" id="ct-dir-row" style="display:none">
+            <span class="ct-label" title="How the move is chosen from the ones that obey the rule. Best-within-rule is the funny one: a pawn storm that pushes the best pawn is a character.">Sincerity</span>
+            <select id="ct-trollsincerity" aria-label="How the surviving move is chosen">
+              <option value="best">Best move that obeys</option>
+              <option value="worst">Worst move that obeys</option>
+              <option value="random">Random move that obeys</option>
+            </select>
+          </div>
+          <label class="ct-switch"><span>Chaos mode (new random directive every N moves)</span><input type="checkbox" id="ct-trollchaosmode"></label>
+          <div class="ct-field ct-range" id="ct-chaos-row" style="display:none">
+            <span class="ct-label">New directive every</span>
+            <input type="range" id="ct-trollchaos" min="2" max="20" step="1" aria-label="Moves between random directives">
+            <span id="ct-trollchaosval" class="ct-val">5</span>
+          </div>
+          <label class="ct-switch" title="When you are winning on the board AND have at least as much time on the clock, switch from winning fast to winning annoyingly."><span>Rage Brain</span><input type="checkbox" id="ct-trollrage"></label>
+          <div id="ct-trollragerow" style="display:none">
+            <div class="ct-field">
+              <span class="ct-label">Tactic</span>
+              <select id="ct-trolltactic" aria-label="Rage tactic"></select>
+            </div>
+            <div class="ct-field ct-range">
+              <span class="ct-label" title="How far ahead on the board before denial may start.">Switch on at</span>
+              <input type="range" id="ct-trolleval" min="100" max="900" step="50" aria-label="Evaluation threshold in centipawns">
+              <span id="ct-trollevalval" class="ct-val">+2.5</span>
+            </div>
+            <div class="ct-field ct-range">
+              <span class="ct-label" title="How far ahead on the clock you must be before the clock-warfare tactics unlock. 0 means simply at least as much time as they have.">Clock lead</span>
+              <input type="range" id="ct-trollclock" min="0" max="60" step="5" aria-label="Required clock lead in seconds">
+              <span id="ct-trollclockval" class="ct-val">0s</span>
+            </div>
+          </div>
+          <label class="ct-switch" title="Make the arrows and the 'What would X play?' button obey the directive too, so the preview is honest about what is about to happen."><span>Directives drive the preview</span><input type="checkbox" id="ct-trollpreview"></label>
+
+          <div class="ct-field">
+            <span class="ct-label">Commentary</span>
+            <select id="ct-trollcommentary" aria-label="Commentary voice">
+              <option value="off">Off</option>
+              <option value="commentator">Sports commentator</option>
+              <option value="grandpa">Grandpa</option>
+              <option value="armchair">Armchair GM</option>
+            </select>
+          </div>
+          <label class="ct-switch"><span>Sarcastic eval</span><input type="checkbox" id="ct-trollsarcastic"></label>
+          <label class="ct-switch"><span>ELO shaming</span><input type="checkbox" id="ct-trollshame"></label>
+          <label class="ct-switch"><span>Judgmental tips</span><input type="checkbox" id="ct-trolljudge"></label>
+          <label class="ct-switch"><span>Telemetry &amp; taunt readouts</span><input type="checkbox" id="ct-trolltelem"></label>
+
+          <div class="ct-troll-head">Panel pranks</div>
+          <label class="ct-switch"><span>Soundboard (synthesised)</span><input type="checkbox" id="ct-trollsound"></label>
+          <label class="ct-switch" title="Reads short quips out loud using your browser's own speech synthesis. No network, no files."><span>Voice quips</span><input type="checkbox" id="ct-trollvoice"></label>
+          <label class="ct-switch"><span>Gaslight mode (labels mutate)</span><input type="checkbox" id="ct-trollgaslight"></label>
+          <label class="ct-switch"><span>Runaway panel</span><input type="checkbox" id="ct-trollrunaway"></label>
+          <label class="ct-switch"><span>Loading theater</span><input type="checkbox" id="ct-trollloading"></label>
+          <label class="ct-switch"><span>Confidence meter that lies</span><input type="checkbox" id="ct-trollconfidence"></label>
+          <label class="ct-switch"><span>Mirror after a loss</span><input type="checkbox" id="ct-trollmirror"></label>
+          <label class="ct-switch"><span>The button that moves</span><input type="checkbox" id="ct-trollswap"></label>
+
+          <a href="#" id="ct-bug" class="ct-bug">Report a bug</a>
+        </div>
+      </div>
+    </details>
+
     <button id="ct-analyze" type="button">Analyze now</button>
     <button id="ct-elomove" type="button">What would 1200 play?</button>
 
     <div id="ct-elobox"><span class="ct-label">ELO move</span> <span id="ct-elotxt">-</span></div>
+    <div id="ct-telem" class="ct-telem" style="display:none"></div>
+    <div class="ct-field" id="ct-frust-row" style="display:none">
+      <span class="ct-label" title="How little the opponent has been allowed to do: captures they managed, checks they landed, trades completed, entries into your half, and how cramped their position is. Rendered here and nowhere else.">Frustration</span>
+      <span id="ct-frustbar"><span id="ct-frustfill"></span></span>
+      <span id="ct-frustval" class="ct-val">0%</span>
+    </div>
     <div id="ct-tip"></div>
     <div id="ct-draghint">Drag the title bar: the panel slides straight through any wall and comes back - no tuck button, works in every mode.</div>
     <div id="ct-status">Idle</div>
