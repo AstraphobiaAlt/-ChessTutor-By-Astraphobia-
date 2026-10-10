@@ -20,6 +20,9 @@
 <div id="ct-root">
   <p id="preview-note">Loading panel.html&hellip;</p>
 </div>
+<script src="../game.js"></script>
+<script src="../lib.js"></script>
+<script src="../troll.js"></script>
 <script>
 fetch('../panel.html').then(r => r.text()).then(html => {
   const root = document.getElementById('ct-root');
@@ -38,6 +41,43 @@ fetch('../panel.html').then(r => r.text()).then(html => {
   const mateSel = document.getElementById('ct-mate'), riskRow = document.getElementById('ct-hunt-riskrow');
   const syncHunt = () => { riskRow.style.display = mateSel.value === 'hunter' ? '' : 'none'; };
   mateSel.addEventListener('change', syncHunt); syncHunt();
+  // Troll mode: the directive and tactic menus are built from troll.js in the real panel, so build them the
+  // same way here. The pranks themselves (sound, gaslight, the runaway panel) are content.js behaviour.
+  const trollDir = document.getElementById('ct-trolldir'), trollTac = document.getElementById('ct-trolltactic');
+  const master = document.getElementById('ct-troll'), body = document.getElementById('ct-trollbody');
+  const summary = document.getElementById('ct-trollsummary');
+  const opt = (v, t, title) => { const o = document.createElement('option'); o.value = v; o.textContent = t; if (title) o.title = title; return o; };
+  trollDir.appendChild(opt('off', 'Off (no directive)'));
+  trollDir.appendChild(opt('chaos', 'Chaos mode (rotate randomly)'));
+  window.CTTroll.DIRECTIVE_GROUPS.forEach(g => {
+    const og = document.createElement('optgroup'); og.label = g.name;
+    window.CTTroll.DIRECTIVES.filter(d => d.group === g.id).forEach(d => og.appendChild(opt(d.id, d.name, d.blurb)));
+    if (og.children.length) trollDir.appendChild(og);
+  });
+  trollTac.appendChild(opt('auto', 'Auto (picks for the moment)'));
+  window.CTTroll.RAGE_GROUPS.forEach(g => {
+    const og = document.createElement('optgroup'); og.label = g.name;
+    window.CTTroll.RAGE_TACTICS.filter(t => t.group === g.id).forEach(t => og.appendChild(opt(t.id, t.name, t.blurb)));
+    if (og.children.length) trollTac.appendChild(og);
+  });
+  const syncTroll = () => {
+    body.style.display = master.checked ? '' : 'none';
+    document.getElementById('ct-dir-row').style.display = (trollDir.value && trollDir.value !== 'off') ? '' : 'none';
+    document.getElementById('ct-trollragerow').style.display = document.getElementById('ct-trollrage').checked ? '' : 'none';
+    const d = window.CTTroll.DIRECTIVE_BY_ID[trollDir.value];
+    summary.textContent = 'Troll mode (' + (master.checked ? 'on' : 'off') + ')' + (master.checked && d ? ' \\u00B7 ' + d.name : '');
+    document.getElementById('ct-confidence-row').style.display = master.checked ? '' : 'none';
+    document.getElementById('ct-frust-row').style.display =
+      master.checked && document.getElementById('ct-trollrage').checked ? '' : 'none';
+  };
+  ['ct-troll', 'ct-trolldir', 'ct-trollrage'].forEach(id => {
+    document.getElementById(id).addEventListener('change', syncTroll);
+  });
+  document.getElementById('ct-bug').addEventListener('click', e => {
+    e.preventDefault();
+    document.getElementById('ct-status').textContent = 'The bug is your position.';
+  });
+  syncTroll();
   document.getElementById('preview-note').textContent =
     'Static preview of the panel markup. The live panel is injected into chess.com by content.js: it fills in ' +
     'the engine name, the arrows on the board, and what Think time / Checkmate style / Natural mistakes do.';

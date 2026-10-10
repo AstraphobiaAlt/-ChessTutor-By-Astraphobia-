@@ -123,3 +123,31 @@
 .ct-overlay .ct-a3 .ct-shaft { stroke: var(--ct-blue); }  .ct-overlay .ct-a3 .ct-head, .ct-overlay .ct-a3 .ct-badge { fill: var(--ct-blue); }
 .ct-overlay .ct-badge-ring { fill: none; stroke: #262522; stroke-width: 0.5; }
 .ct-overlay .ct-badge-txt { fill: #1b2a0c; font: 700 2.9px system-ui, -apple-system, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: central; }
+
+/* ---- Troll mode ----
+   A joke layer on top of the engine. Everything in this block is cosmetic or a move filter applied AFTER
+   the search; none of it changes what the engine is asked, and every taunt is rendered inside this panel
+   where only the person running the extension can read it. */
+#ct-confidence-row { margin-top: -0.35rem; margin-bottom: 0.6rem; }
+#ct-confidence { color: var(--ct-amber); font-weight: 700; }
+.ct-telem { margin-top: 0.5rem; font-size: 0.68rem; line-height: 1.45; color: var(--ct-faint); white-space: pre-line; }
+.ct-telem:empty { display: none; }
+#ct-frustbar { flex: 1; min-width: 0; height: 0.4rem; background: #111; border-radius: 0.2rem; overflow: hidden; }
+#ct-frustfill { display: block; height: 100%; width: 0%; background: linear-gradient(90deg, var(--ct-amber), var(--ct-red)); transition: width 0.3s; }
+#ct-frust-row { margin-top: 0.55rem; }
+
+#ct-trollbox { margin-top: 0.7rem; padding-top: 0.5rem; border-top: 1px solid var(--ct-bg3); font-size: 0.78rem; }
+#ct-trollbox summary { cursor: pointer; color: var(--ct-amber); font-weight: 700; }
+#ct-trollinner { margin-top: 0.5rem; }
+#ct-trollbody { border-left: 2px solid var(--ct-bg3); padding-left: 0.55rem; margin-top: 0.3rem; }
+.ct-troll-head { margin: 0.6rem 0 0.1rem; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ct-faint); }
+#ct-trollbox .ct-switch { font-size: 0.8rem; min-height: 2.1rem; }
+#ct-trollbox .ct-switch span { padding-right: 0.5rem; line-height: 1.25; }
+#ct-trollbox .ct-label { white-space: normal; line-height: 1.25; }
+#ct-trollbox select { width: 55%; font-size: 0.78rem; min-height: 2.2rem; }
+#ct-trollragerow { margin-top: -0.2rem; }
+.ct-bug { display: inline-block; margin-top: 0.7rem; font-size: 0.7rem; color: var(--ct-faint); text-decoration: underline; cursor: pointer; }
+.ct-bug:hover { color: var(--ct-dim); }
+/* Mirror mode: the panel reads back to front for a while after a loss. */
+#ct-panel.ct-mirror { transform: scaleX(-1); }
+#ct-panel.ct-mirror #ct-body { transform: scaleX(-1); }

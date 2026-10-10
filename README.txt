@@ -1,6 +1,111 @@
-CHESS TUTOR 1.10
+CHESS TUTOR 1.11
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
+
+UPDATE 1.11 — TROLL MODE
+Update 1.11 is 1.10 with a joke layer bolted on top. It is OFF by default and the whole section is hidden
+until you open "Troll mode" and switch it on; with it off the tutor behaves exactly as it did in 1.10.
+
+Two rules govern everything in it:
+    1. Nothing in Troll mode changes what the engine is asked. Directives and rage tactics only choose which
+       of the legal moves to play AFTER the search has answered, so the analysis path is untouched and real
+       analysis cannot be broken by a joke.
+    2. Every taunt, index and fake number is rendered inside your own panel. Nothing is written to the page,
+       sent to chat, or shown to another player. Every readout is aimed at you.
+
+Troll mode has three parts.
+
+DIRECTIVES - one dumb rule, played completely sincerely
+A directive filters the legal move list down to the moves that obey a single deranged constraint, then plays
+the best of what survives. There are 39 of them, in six groups:
+
+    Pawn family          pawn storm (push a pawn, any pawn) - rook pawn rampage (a- and h-pawns only) -
+                         pawn pacifism (never move a pawn) - the Great Wall (no pawn past the third rank) -
+                         phalanx (only a pawn beside another pawn) - leapfrog (only the most backward pawn)
+    Geometry             dark-/light-square devotion - homebody (never cross the midline) - monorail (one file) -
+                         elevator (no diagonals) - diagonal zealot (no straight lines) - bank rank - corner
+                         office - checkerboard
+    Relationships        leash law (never end a move alone) - social distancing (never end one beside a friend) -
+                         wingman (stay next to the queen) - tag team (two pieces, strictly alternating) -
+                         monkey see, monkey do (mirror the opponent's last move)
+    Personality          berserker (capture if you can) - pacifist (never capture) - check junkie - full retreat -
+                         all gas no brakes - turtle - bull in a china shop - tempo terrorist (leave them the
+                         fewest legal replies)
+    Piece fixation       knights of the round table - the long walk (the king walks to the far side) - the
+                         queen's world tour (all four quadrants, in order) - bishop simp
+    Deliberate disasters bongcloud - blunder chicken (second best, then third, until it panics) - worst legal
+                         move - roll for it - magnet mode - salute mode (one good move, then the game is
+                         thrown) - time troll (instant for ten moves, then thirty seconds on the eleventh)
+
+    Sincerity       how the surviving move is chosen. "Best move that obeys" is the default and the funny one:
+                    a pawn storm that pushes the BEST pawn is a character, a random pawn push is just noise.
+    Chaos mode      a new random directive every N moves, announced in the panel.
+    Preview         when on, the arrows and the "What would X play?" button obey the rule too, so the board
+                    shows the move that is about to be played instead of the one the engine preferred.
+
+A directive that has no legal move left (no pawns to push, no dark square to reach) is SUSPENDED for that
+move: the engine's real move is played and the panel says "DIRECTIVE SUSPENDED". The breakdown is the joke,
+so it is announced rather than swallowed.
+
+THE RAGE BRAIN - win on the board AND on the clock, then refuse to engage
+Not a rule but a gate. It switches the play style from "win fast" to "win annoyingly" only when you are
+winning by at least the configured margin AND have at least as much time as the opponent - being annoying
+takes time, so the clock is half the condition. Any missing input fails closed and says why in the panel, the
+same way the tutor's clock handling does everywhere else: no clock, no siege. It then picks from:
+
+    Denial          teflon (never end on a square they attack) - trade refusal (never capture, ever) - material
+                    hoarding (refuse all simplification) - zebra cage (stay two squares from everything) - the
+                    tease (offer a piece, then slide it away) - squatter's rights - no-contact fortress - wall
+                    of Berlin (no pawn breaks, ever)
+    Clock warfare   clock siege (fast, safe, pointless moves that force them to think) - the freeze (maximum
+                    think time on every move) - denial by speed (instant, every move) - tick-tock
+    Slow win        the long goodbye (the slowest forced mate; never mate in one) - the yawn (the least
+                    committal legal move) - lap of honour (underpromote to a knight) - the escort (the king
+                    walks a passed pawn in) - the carousel (a three-move cycle, forever) - wall of Berlin
+
+A big clock gap wins outright: humiliation tactics need time on your clock and grinding them down needs time
+off theirs, so the two are never mixed. The tactic never repeats twice running. Tactics that own a timing
+(clock siege, denial by speed, the freeze) override the Think time for the next search, and the panel says
+"troll timing" so the window is never a mystery.
+
+    Frustration Index   a 0-100% bar built from what the opponent has been ALLOWED to do: captures they
+                        managed, checks they landed, trades completed, entries into your half, and how
+                        cramped their position is. "Pieces they have captured: 0 · moves played: 47."
+    Tilt detector       watches their average move time and reports a collapse ("dropped 61%. Notable.").
+                        Reported, never acted on.
+
+PANEL PRANKS AND COMMENTARY (they troll you, nobody else)
+    Confidence meter that lies   99% when the engine is winning, 4% when you are. A fabricated number.
+    Loading theater              "41%... defragmenting the knights... re-teaching the bishops to move
+                                 diagonally..." while the real 95 MB download runs.
+    Gaslight mode                labels silently mutate: "Think time" becomes "Vibes". Cosmetic only - the
+                                 control behind the label does not change.
+    Runaway panel                the panel sidles away as you reach for a control. It holds still while a
+                                 control has focus, so it never actually blocks you.
+    The button that moves        once per session, "Analyze now" swaps places with "Hide" for one hover.
+    Mirror mode                  the panel reads back to front for thirty seconds after a loss.
+    Judgmental tips              the tip line stops explaining and starts commenting.
+    Soundboard                   sad trombone on a blunder, airhorn on a mate, vinyl scratch on a hung queen,
+                                 applause on a genuinely good move. Everything is synthesised with WebAudio,
+                                 so the extension ships no media and works offline. Optional "voice quips" use
+                                 your browser's own speech synthesis and are opt-in, because it talks out loud.
+    Commentary                   a sports commentator, a grandpa, or an armchair GM grading every move
+                                 ("B+. Solid. Boring, but solid."), plus a sarcastic eval ("+2.3 (and yet,
+                                 here we are)") and ELO shaming ("That move was rated 412. You are rated
+                                 1200. Math is math.").
+
+FAIR PLAY
+Troll mode adds nothing that talks to another player: no chat, no emotes, no network, nothing written to the
+chess.com page. Every taunt is a line of text in your own panel. The play styles themselves sit on exactly the
+same footing as auto-play already did - bot games, analysis boards, and playing both sides yourself. Auto-
+playing in live games against another person is against chess.com's fair-play rules and can get an account
+closed, with or without a joke attached.
+
+(dev) directives, the Rage gate and tactics, the frustration index and the tilt detector are unit-tested:
+      node tests/troll.test.js
+(dev) the panel wiring - directives really change the move auto-play sends, suspended rules are announced,
+      settings persist, and the Rage gate really does stay shut - is integration-tested in jsdom:
+      node tests/troll-ui.test.js   (needs jsdom once: npm install --no-save jsdom)
 
 UPDATE 1.10 — GAME CONTEXT: MOVE HISTORY, REAL CLOCKS, PONDERING
 Move history: every search (all styles, browser and native engine) now gets the start position plus every
