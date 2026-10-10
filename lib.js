@@ -317,15 +317,25 @@
   }
   /* The depth an "instant" answer should be read from: the shallowest depth that already holds every requested
      line. When the engine has moved on to a deeper depth, the one below it is as complete as it will ever get -
-     a forced position simply has fewer moves than MultiPV asked for - so that depth is used instead. */
-  function instantDepth(byDepth, want) {
-    var d = firstDepth(byDepth, want);
-    if (d !== null) return d;
+     a forced position simply has fewer moves than MultiPV asked for - so that depth is used instead.
+     `floor` is the strength floor: "no mistakes are allowed" means an instant answer is never a depth-1 guess.
+     A capped level waits for its own read depth; an uncapped one (Full engine) waits for INSTANT_MIN_DEPTH. */
+  function instantDepth(byDepth, want, floor) {
+    floor = floor > 0 ? Math.floor(floor) : 0;
     var ds = Object.keys(byDepth).map(Number).sort(function (a, b) { return a - b; });
+    for (var i = 0; i < ds.length; i++) {
+      if (ds[i] < floor) continue;
+      if (Object.keys(byDepth[ds[i]]).length >= want) return ds[i];
+    }
     if (ds.length < 2) return null;
     var prev = ds[ds.length - 2];
-    return Object.keys(byDepth[prev]).length ? prev : null;
+    return prev >= floor && Object.keys(byDepth[prev]).length ? prev : null;
   }
+  /* Think time 0 has to still produce full-strength play. The first complete MultiPV set is depth 1, which
+     hangs pieces to whatever the shallow search cannot see - and "Full engine" promises the objectively best
+     move. So an instant answer waits until the search has proved at least this deep before it stops (the
+     safety movetime is the outer bound for the search). Capped levels use their own depth as the floor. */
+  var INSTANT_MIN_DEPTH = 12;
 
   /* A UCI `score mate +N` is a mate for the side to move, and lower positive values are sooner.  MultiPV
      normally ranks this correctly already, but selecting it explicitly keeps auto-play's mate-first policy
@@ -339,6 +349,35 @@
         (line.score === best.score && (line.depth || 0) > (best.depth || 0))) best = line;
     });
     return best;
+  }
+
+  /* Mate proofs must survive the deepest search that looked at the same move. A `score mate +N` from an early
+     iteration that a later iteration replaced with a normal score was a mirage - playing it is a real mistake,
+     and "no mistakes are allowed" forbids it. Takes the flat list of every info line seen for a search (all
+     depths, mate claims included) and returns only the claims whose move's DEEPEST sighting is still a
+     positive mate, carrying that deepest line's score. */
+  function confirmedMateLines(lines) {
+    var deepest = {}, out = [];
+    (lines || []).forEach(function (l) {
+      if (!l || !l.move) return;
+      var prev = deepest[l.move];
+      if (!prev || (l.depth || 0) > (prev.depth || 0)) deepest[l.move] = l;
+    });
+    Object.keys(deepest).forEach(function (m) {
+      var l = deepest[m];
+      if (l.type === 'mate' && l.score > 0) out.push(l);
+    });
+    return out;
+  }
+
+  /* "No mistakes are allowed" - the cases where nothing but the engine's own best move (or a verified forced
+     mate) may be played: Natural mistakes off, or a strength level whose configured error rate is zero
+     (2000+, Full engine). Random slips and hunter concessions are human-simulation features; they only exist
+     outside these cases, and every one of them is labelled in the panel. */
+  function strictPlay(opt) {
+    if (!opt) return true;
+    if (!opt.mistakes) return true;
+    return !(ERROR_RATES[opt.elo] > 0);
   }
 
   /* ---- what to ask the engine for ----
@@ -495,16 +534,16 @@
     });
     return out;
   }
-  // the same move seen twice: the deeper line carries the better information, and a proven mate is never
-  // dropped in favour of a deeper line that only has a centipawn score
+  // the same move seen twice: the deeper line carries the better information - including when it REFUTES a
+  // shallow mate claim. A `score mate` a later iteration replaced with a normal score was a mirage; keeping it
+  // would play a move the engine no longer believes in, and no mistakes are allowed.
   function deeperLine(a, b) {
-    if (a.type === 'mate' && a.score > 0) return a;
-    if (b.type === 'mate' && b.score > 0) return b;
     return (b.depth || 0) > (a.depth || 0) ? b : a;
   }
   function huntPick(list, fen, opt) {
     var extraMates = Array.isArray(opt && opt.mateLines) ? opt.mateLines : [];
-    var mate = fastestMateLine(list.concat(extraMates));
+    var evidence = list.concat(extraMates, Array.isArray(opt && opt.deepLines) ? opt.deepLines : []);
+    var mate = fastestMateLine(confirmedMateLines(evidence));
     if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: moveTraits(fen, mate.move), mistake: false };
     // The pool may combine the level's lines with lines from the deepest iteration. Do not let an optimistic
     // shallow score define the risk budget for deeper candidates: use the best evaluation at the deepest depth seen.
@@ -515,7 +554,11 @@
         best = l; bestDepth = depth;
       }
     });
-    var floor = lineValue(best) - huntTolerance(opt && opt.huntRisk, lineValue(best));
+    // "No mistakes are allowed" (Natural mistakes off, or a zero-error level like Full engine) closes the risk
+    // dial: an attacking move is only played when it is exactly as good as the engine's best line. Concessions
+    // inside the dial are deliberate human-simulation and exist only when mistakes are on at a human level.
+    var tol = strictPlay(opt) ? 0 : huntTolerance(opt && opt.huntRisk, lineValue(best));
+    var floor = lineValue(best) - tol;
     var pick = null;
     list.forEach(function (l) {
       var t = moveTraits(fen, l.move);
@@ -532,38 +575,47 @@
 
   /* ---- which move to actually play (auto-play and "what would X play?") ----
      lines - the engine's candidate lines for the position, best first (normally the strength-capped depth)
-     opt   - { elo, mistakes, mateMode, rand, fen, huntRisk, mateLines }
+     opt   - { elo, mistakes, mateMode, rand, fen, huntRisk, mateLines, deepLines }
        mateLines                   : optional positive mate proofs collected from every reported search depth.
                                      They are used only by mate-seeking styles; they never enter the ELO slip draw.
+       deepLines                   : optional lines from the deepest iteration, used as EVIDENCE - a mate claim
+                                     any deeper line for the same move refutes is dropped (confirmedMateLines).
        mateMode 'shortest' (default): a proven mate outranks everything, and among proven mates the smallest
                  positive mate score - the fewest moves - is played. If no mate is proven, the selected-depth
                  top line (or a natural slip when enabled) is used.
        mateMode 'normal'            : regular play, the top line of the search, no mate hunting.
        mateMode 'hunter'            : aggressive. The fewest-move mate is taken first (from all mate proofs); with
-                 no mate, the most aggressive sound candidate is played - check, bait, then attack on the king - as
-                 long as its evaluation stays within `huntRisk` of the best line. Needs `fen` to see the board;
+                 no mate, the most aggressive sound candidate is played - check, bait, then attack on the king -
+                 as long as its evaluation stays within `huntRisk` of the best line. Needs `fen` to see the board;
                  without it the hunter behaves like 'shortest'.
-       mistakes on                  : the ELO deviation roll may swap the top line for another candidate, which
-                                      is what makes 400-1500 look like a person instead of a machine.
-       mistakes off                 : disables that random deviation; search depth and mate style still apply.
-     A proven mate is never traded away for a random slip. A hunter is never overruled by that roll either - it is a
-     deliberate style, not an accident. Returns { uci, line, mate, mistake, hunt } or null when nothing is legal. */
+       mistakes on + a level with a real error rate (below 2000)
+                                      : the ELO deviation roll may swap the top line for another candidate, and
+                                      the hunter may spend its Hunter-risk margin on an attack. These are the
+                                      deliberate human-simulation features; every one is labelled in the panel.
+       mistakes off, or 2000+/Full engine (strictPlay)
+                                      : NO mistakes are allowed - the engine's objectively best move (or a
+                                      verified forced mate) is the only thing that may be played, in every style.
+     A proven mate is never traded away for a random slip. A hunter is never overruled by that roll either. Every
+     mate claim is checked against the deepest evidence for the same move first. Returns
+     { uci, line, mate, mistake, hunt } or null when nothing is legal. */
   function chooseMove(lines, opt) {
     opt = opt || {};
     var list = (lines || []).filter(function (l) { return l && l.move; });
     if (!list.length) return null;
-    var mateLines = list.concat(Array.isArray(opt.mateLines) ? opt.mateLines : []);
+    // mate claims must survive the deepest evidence for the same move before any style may take them
+    var trusted = confirmedMateLines(list.concat(Array.isArray(opt.deepLines) ? opt.deepLines : [],
+      Array.isArray(opt.mateLines) ? opt.mateLines : []));
     if (opt.mateMode === 'hunter') {
       if (opt.fen) return huntPick(list, opt.fen, opt);
-      var huntMate = fastestMateLine(mateLines);
+      var huntMate = fastestMateLine(trusted);
       if (huntMate) return { uci: huntMate.move, line: huntMate, mate: huntMate, hunt: null, mistake: false };
     }
     if (opt.mateMode !== 'normal') {
-      var mate = fastestMateLine(mateLines);
+      var mate = fastestMateLine(trusted);
       if (mate) return { uci: mate.move, line: mate, mate: mate, hunt: null, mistake: false };
     }
     var best = list[0];
-    if (opt.mistakes) {
+    if (!strictPlay(opt)) {
       var moves = list.map(function (l) { return l.move; });
       var picked = eloMove(best.move, moves, opt.elo, opt.rand);
       if (picked && picked !== best.move) {
@@ -619,7 +671,9 @@
   var api = { fenBoardMap: fenBoardMap, uciToSan: uciToSan, placementOf: placementOf, buildFen: buildFen, setTurn: setTurn,
     parseOption: parseOption, parseInfo: parseInfo, evalText: evalText, whitePct: whitePct, sqCenter: sqCenter,
     arrowShape: arrowShape, fmtCount: fmtCount, panelGeom: panelGeom,
-    bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, fastestMateLine: fastestMateLine, searchLimits: searchLimits,
+    bestDepth: bestDepth, firstDepth: firstDepth, instantDepth: instantDepth, fastestMateLine: fastestMateLine,
+    confirmedMateLines: confirmedMateLines, strictPlay: strictPlay, INSTANT_MIN_DEPTH: INSTANT_MIN_DEPTH,
+    searchLimits: searchLimits,
     reportDepth: reportDepth, chooseMove: chooseMove,
     goCommand: goCommand, paceWait: paceWait, eloMove: eloMove, ERROR_RATES: ERROR_RATES,
     pieceAttacks: pieceAttacks, attackedBy: attackedBy, sideInCheck: sideInCheck, applyMove: applyMove,

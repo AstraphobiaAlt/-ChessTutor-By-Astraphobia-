@@ -1,6 +1,27 @@
-CHESS TUTOR 1.11
+CHESS TUTOR 1.12
 Load this folder unpacked (chrome://extensions > Developer mode > Load unpacked), then open any chess.com page
 (e.g. https://www.chess.com/analysis).
+
+UPDATE 1.12 — NO MISTAKES ARE ALLOWED (every checkmate style)
+1.11 + a hard guarantee for the move-selection layer, after Full engine + auto-play + Think time 0 was caught
+making real mistakes on Stockfish 19. Three holes, all closed:
+    1. Instant was shallow. Think time 0 stopped the search at the engine's first complete MultiPV iteration -
+       depth 1 - and played that, even at Full engine, so "the objectively best move" was a guess that hangs
+       pieces. Now an instant answer waits for a complete result AT THE LEVEL'S STRENGTH: a capped level stops
+       at its own read depth, Full engine at full-strength depth (12+) or the safety window, whichever comes
+       first. Instant saves the think-time clock; it no longer replaces the engine with a shallow guess.
+    2. Stale mate claims. A "score mate +N" found by an early iteration used to stay a candidate even when a
+       deeper iteration of the SAME move replaced it with a normal score - the shortest-mate and hunter styles
+       would then play a mate that was never real, and game review calls that a mistake. Every mate proof is
+       now confirmed against the deepest search evidence for the same move before any style may take it.
+    3. The hunter ignored the Natural mistakes switch. It could give up 0.3-2.4 pawns for an attack even with
+       mistakes off and even at Full engine. Now the switch and the level govern EVERY style: with Natural
+       mistakes off - or at any zero-error level (2000+, Full engine) - no style plays anything but the
+       engine's best move, except a verified forced mate. Hunter concessions and random slips are human
+       simulation and exist only with mistakes ON at a below-2000 level, each one labelled in the panel
+       ("hunter: check + bait", "natural 400 ELO slip"). An attack that TIES the best move is always allowed -
+       a tie is not a mistake.
+Maximum Strength is unchanged (the final UCI bestmove was already authoritative there).
 
 UPDATE 1.11 — TROLL MODE
 Update 1.11 is 1.10 with a joke layer bolted on top. It is OFF by default and the whole section is hidden
@@ -206,7 +227,9 @@ It is one setting for both paths, and it is independent from the ELO level:
 
     5s at 2500 ELO   thinks 5s, plays the 2500 ELO lines
     5s at 800 ELO    thinks 5s too, then plays the move its depth-3 look produced
-    0 (instant)      no clock at all: the first complete engine result is used and the search is stopped
+    0 (instant)      no clock at all: the search stops as soon as a complete result AT THE LEVEL'S STRENGTH
+                     exists - the level's own read depth, or full-strength depth (12+) for Full engine - so
+                     instant play is real play, not a depth-1 guess (see UPDATE 1.12)
 The slider moves in 0.1s steps, so anything from "instant" to a minute is available.
 
 That separation matters: the ELO level no longer cuts the search short. A level used to be a depth cap, so a
@@ -217,23 +240,27 @@ the tab, so a low level with a 30s window costs the same as a high one.
 
 CHECKMATE STYLE (this really decides the move - it is not a display setting)
 All three styles govern the move choice used by auto-play and "What would X play?" A mate is only claimed when
-the engine reports a positive `score mate +N` proof. The shortest-mate style uses those proofs but otherwise uses
-the selected-level move (or a Natural mistakes deviation). The hunter also ranks non-mate candidates for pressure;
+the engine reports a positive `score mate +N` proof AND the deepest search evidence for that move still confirms
+it (UPDATE 1.12: a claim a later iteration refuted is dropped, never played). The shortest-mate style uses those
+verified proofs but otherwise uses the selected-level move (or a Natural mistakes deviation). The hunter also
+ranks non-mate candidates for pressure;
 Regular always follows the top line. A selected mate or hunter attack is shown as the headline/first arrow, so the
 panel's main move matches that deliberate choice. Thus mate styles may look like they do nothing in a position
 with no forced win, while the hunter can still prefer a sound check or attack:
 
-    Mate in the fewest moves   the shortest positive mate proof reported anywhere during the think-time search is
+    Mate in the fewest moves   the shortest verified mate proof reported anywhere during the think-time search is
                                taken - even if it was not line 1 of the MultiPV list or was found deeper than the
                                selected ELO depth. Ordinary non-mate moves still come from the selected level, so
                                a long think does not silently turn 400 ELO into full engine. With no mate proof,
                                the selected-depth move (or a Natural mistakes slip, if enabled) is used.
-    Aggressive hunter          every proven mate from the think-time search is taken (fewest moves first), even
+    Aggressive hunter          every verified mate from the think-time search is taken (fewest moves first), even
       (checks + bait)         if it was not line 1 or was proved deeper than the selected level. With no mate it
                                plays for pressure instead of the quiet best line: a check, then a bait (a piece it
                                leaves en prise on purpose), then a move that attacks the enemy king. Every
                                candidate still has to stay within "Hunter risk" of the best line the engine can
-                               see, so the attack is sound rather than reckless.
+                               see, so the attack is sound rather than reckless - and the allowance is ZERO with
+                               Natural mistakes off or at a 2000+/Full engine level (UPDATE 1.12: no mistakes are
+                               allowed), so there it only takes an attack that is exactly as good as the best move.
     Regular best move          no mate hunting: it plays the top line of the search, which is often a long, quiet
                                win instead of the fastest one.
 
@@ -243,7 +270,9 @@ HUNTER RISK (shown only while the hunter is selected)
     Very aggressive (1.2)      within 1.2 - and twice that (2.4) when the position is already +2.5 or better,
                                which is the "the attack is winning anyway, play it" case
     The dial is not a promise to play badly: the engine's own evaluation is the guard rail, so the hunter attacks
-    with sound moves. A bait that the engine scores as losing (say -3.0) is refused at every setting.
+    with sound moves. A bait that the engine scores as losing (say -3.0) is refused at every setting. The dial is
+    also OFF unless it can be deliberate: with Natural mistakes off - or at a 2000+/Full engine level - the
+    allowance is zero and the hunter only plays an attack that ties the best move (UPDATE 1.12).
 
 WHAT THE HUNTER ACTUALLY DOES WITH THE ENGINE
     - it asks for 12 MultiPV candidates instead of the usual 3 in analysis (5 in auto-play), because a bait or a
@@ -252,27 +281,30 @@ WHAT THE HUNTER ACTUALLY DOES WITH THE ENGINE
     - it reads the board itself (a pure attack/defence trace of the position, lib.js moveTraits) to know whether
       a candidate gives check, offers material or points at the enemy king. The tracer only classifies moves the
       engine already produced; chess.com's own legal-move list still decides what can be played.
-    - the natural-mistake roll is skipped in hunter mode: an attack is a decision, not an accident (a proven mate
-      was never traded away for a slip in any style).
+    - the natural-mistake roll is skipped in hunter mode: an attack is a decision, not an accident (a verified
+      mate was never traded away for a slip in any style). The decision itself is still gated: the hunter only
+      spends its risk margin while Natural mistakes is on at a below-2000 level (UPDATE 1.12).
     - the hunter's candidates come from the deepest iteration the search reached as well as the level's own depth,
       so the ELO level matters less while it is attacking: at 400 ELO + hunter + a 5s think time it plays the
       attack (or the mate) that the whole 5 seconds of searching proved, not the depth-1 line. The level still
-      decides when nothing aggressive is available (then its own top line is played), and mistakes stay off.
+      decides when nothing aggressive is available (then its own top line is played), and slips stay off.
     - the panel says what it saw, e.g. "hunter: check + bait (3 pts offered)" or "hunter mate M3", so an unusual
       move is explainable instead of mysterious.
 What a mate-proof can reach is bounded by how deep the search got, so deeper mates still need Think time (and the
 hunter also sees the deepest iteration the window reached). "Full engine" plus a few seconds finds long mates.
 
-NATURAL MISTAKES
-    On   (default) a low level sometimes makes a random deviation from the best line among the engine's candidate
-               moves - 400 ELO deviates often, 1800 rarely, 2000+ never. When the deviation roll fires, it always
-               chooses a different candidate (the chance matches the level's configured error rate).
-    Off  disables that random deviation. The engine still uses the selected level's search depth, so a shallow
-               search can miss tactics or choose a move that later looks like a mistake. A checkmate style can
-               also deliberately choose a different line: shortest-mate takes a proven mate and the hunter selects
-               an aggressive candidate. The hunter ignores this switch because its attacking move is intentional.
-The switch also drives the "What would X play?" button. Random deviations never replace an engine-proven forced
-mate: the shortest-mate and hunter styles prioritize the fastest proven mate found during the think-time search.
+NATURAL MISTAKES (the switch now governs EVERY checkmate style - UPDATE 1.12)
+    On   (default) at a below-2000 level, a deliberate deviation from the best line is allowed: sometimes a random
+               one among the engine's candidate moves - 400 ELO deviates often, 1800 rarely, 2000+ never - and,
+               in the aggressive hunter, up to the selected Hunter risk in evaluation for an attack. Both are
+               human simulation, both are labelled in the panel ("natural 400 ELO slip", "hunter: check + bait").
+    Off  NO mistakes are allowed: every checkmate style plays the engine's objectively best move, except a
+               verified forced mate. No random deviation, no hunter concession - the hunter's risk allowance
+               becomes zero and it only takes an attack that TIES the best move. 2000+ and Full engine behave
+               this way with the switch on as well: their error rate is zero, so no style may deviate there.
+The switch also drives the "What would X play?" button. Deviations never replace an engine-verified forced mate:
+the shortest-mate and hunter styles prioritize the fastest verified mate found during the think-time search, and
+a mate claim the deepest search evidence refutes is dropped before any style sees it.
 "Top 3 moves" only hides/shows arrows; it does not remove the candidate lines used for mate checks or random
 mistakes, so hiding arrows cannot silently turn the Natural mistakes setting off.
 
@@ -282,10 +314,12 @@ a move when it is genuinely that side's turn, checks the current board position 
 the move through chess.com's own legal-move list. A stale or illegal move is refused instead of forced.
 
 Auto-play ELO is independent from the normal Play level: it is the strength used for the moves it plays. Both
-share Think time. In shortest-mate and regular styles, the Natural mistakes switch controls random deviations
-(with proven mates protected); the hunter ignores it because its aggressive choices are deliberate. The "Move
-dispatch" line in the panel reads "After 5s thinking" (or "Immediate (instant)" at 0) because that think time is
-the only wait before a move goes out - there is no separate pacing timer.
+share Think time. The Natural mistakes switch controls every style's deliberate deviations: random slips in
+shortest-mate and regular play, the Hunter-risk concessions in the aggressive hunter (verified mates always
+protected and never replaced). With mistakes off - or at Full engine / any 2000+ level - auto-play plays the
+engine's best move every time (UPDATE 1.12). The "Move dispatch" line in the panel reads "After 5s thinking"
+(or "Immediate (instant)" at 0) because that think time is the only wait before a move goes out - there is no
+separate pacing timer; instant still waits for the level-strength result itself (see UPDATE 1.12).
 
 MOVING THE PANEL
 Move the panel by dragging its title bar. The screen edges do not stop it: push it half past a wall and it stays

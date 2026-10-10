@@ -44,7 +44,7 @@
       <span id="ct-timeval" class="ct-val">5s</span>
     </div>
     <div class="ct-field">
-      <span class="ct-label" title="Fewest moves: takes the shortest mate the engine proves anywhere in the think-time search; ordinary moves stay at the selected level. Aggressive hunter: takes the shortest proven mate, or prefers a sound attack - checks, newly offered pieces, attacks on the king, and sustained pressure. It can give up up to the selected Hunter risk in evaluation for pressure. No guaranteed traps or mate in five. Regular: it simply plays the best line of the search.">Checkmate style</span>
+      <span class="ct-label" title="Fewest moves: takes the shortest mate the engine proves anywhere in the think-time search (only proofs the deepest search still confirms); ordinary moves stay at the selected level. Aggressive hunter: takes the shortest verified mate, or prefers a sound attack - checks, newly offered pieces, attacks on the king, and sustained pressure. It can give up up to the selected Hunter risk in evaluation for pressure - but never with Natural mistakes off or at a 2000+/Full engine level, where every style plays the engine's best move. No guaranteed traps or mate in five. Regular: it simply plays the best line of the search.">Checkmate style</span>
       <select id="ct-mate" aria-label="Checkmate style">
         <option value="maximum">Maximum Strength (competitive)</option>
         <option value="shortest">Mate in the fewest moves</option>
@@ -53,14 +53,14 @@
       </select>
     </div>
     <div class="ct-field" id="ct-hunt-riskrow">
-      <span class="ct-label" title="How much evaluation the hunter may give up for an attacking move (pawns). Every candidate still has to stay this close to the best line the engine can see, so the attack is sound: sound 0.3, balanced 0.6, very aggressive 1.2 - and twice that when the position is already clearly winning.">Hunter risk</span>
+      <span class="ct-label" title="How much evaluation the hunter may give up for an attacking move (pawns). Every candidate still has to stay this close to the best line the engine can see, so the attack is sound: sound 0.3, balanced 0.6, very aggressive 1.2 - and twice that when the position is already clearly winning. Only active while Natural mistakes is on at a below-2000 level: with mistakes off (or at Full engine) the allowance is zero and the hunter only takes an attack that is exactly as good as the best move.">Hunter risk</span>
       <select id="ct-hunt-risk" aria-label="Hunter risk">
         <option value="sound">Sound (0.3)</option>
         <option value="balanced">Balanced (0.6)</option>
         <option value="very">Very aggressive (1.2)</option>
       </select>
     </div>
-    <label class="ct-switch" title="On: a low ELO level sometimes deviates to another engine candidate. Off: disables only that random deviation; a shallow search can still miss tactics, and mate style can deliberately pick another move. The aggressive hunter ignores this switch."><span>Natural mistakes</span><input type="checkbox" id="ct-mistakes"></label>
+    <label class="ct-switch" title="On (below 2000 ELO): a level sometimes deviates to another engine candidate, and the hunter may spend its Hunter-risk margin on an attack - deliberate, labelled human-simulation. Off: NO mistakes are allowed - every checkmate style plays the engine's best move, except a verified forced mate. 2000+ and Full engine never deviate either way."><span>Natural mistakes</span><input type="checkbox" id="ct-mistakes"></label>
     <div class="ct-field">
       <span class="ct-label">Memory (hash)</span>
       <select id="ct-hash" aria-label="Hash memory">

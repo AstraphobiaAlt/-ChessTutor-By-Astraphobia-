@@ -2,10 +2,13 @@
    mimics a chess.com board, talks to a fake UCI engine, and checks what the settings actually do:
      - Think time is the search window at EVERY level (400 ELO + 5s really sends `go movetime 5000`)
      - the move is still read from the level's depth, so the think time does not turn 400 ELO into full engine
-     - Think time 0 stays instant (`go depth N`, stopped as soon as a complete answer exists)
+     - Think time 0 stays instant (`go depth N` for a capped level / the safety window for Full engine), stopped
+       once a complete answer AT THE LEVEL'S STRENGTH exists - never a depth-1 guess
      - auto-play dispatches as soon as that search is back; there is no extra pacing timer
-     - Checkmate style decides between a mate proved anywhere in the search, an aggressive candidate, and the regular top line
-     - Natural mistakes controls only deliberate random deviations, and never replaces a proven mate
+     - Checkmate style decides between a mate proved anywhere in the search (and still confirmed by the deepest
+       evidence), an aggressive candidate, and the regular top line
+     - Natural mistakes off (or a zero-error level like Full engine) means NO style deviates from the engine
+       best move - no slips, no hunter concessions - except a verified forced mate
      - the new controls are in the panel and are persisted through chrome.storage
    Run with: node tests/panel-logic.test.js       (needs jsdom once: npm install --no-save jsdom)
    Without jsdom installed the file skips itself, so the offline unit tests still run. */
@@ -466,8 +469,20 @@ async function firstPlayedMove(t) {
   }
   {
     const r = await autoplayCase({ autoplayElo: 400, time: 0, mateMode: 'normal', mistakes: false }, { depths: 4 });
-    eq(r.uci, 'e2e4', 'Think time 0 auto-plays the first complete result');
+    eq(r.uci, 'e2e4', 'Think time 0 auto-plays the first complete result at the level depth (400 ELO = depth 1)');
     ok(/instant/.test(r.status), 'and says it played instantly: ' + r.status);
+  }
+  {
+    // Full engine + Think time 0 must NOT answer from the shallow "first complete result" (depth 1): the
+    // instant strength floor keeps the search going to full-strength depth before it may stop - the engine
+    // the user is running (Stockfish 19) is not replaced by a depth-1 guess. "No mistakes are allowed."
+    const t = await boot({ elo: 3200, autoplayElo: 3200, time: 0, auto: false, autoplay: true, mateMode: 'normal',
+      mistakes: false, side: 'me', open: true }, { depths: 4 });
+    ok(await until(() => /played from depth 4/.test(t.status()) ? true : false),
+      'Full engine + instant answers from the deepest iteration, not depth 1: ' + t.status());
+    ok(!/first complete result/.test(t.status()), 'and never labels it a shallow first result: ' + t.status());
+    eq(await firstPlayedMove(t), 'e2e4', 'and plays that deepest line');
+    t.win.close();
   }
 
   // ---------- 4a. the Natural mistakes switch: the pick changes and the setting is stored ----------

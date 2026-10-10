@@ -2,13 +2,15 @@
    Run with: node tests/autoplay.test.js
    These pin down the user-visible promises:
      - Think time is how long the engine searches before it answers AND before auto-play moves, at every ELO
-     - Think time 0 uses the first complete result
+     - Think time 0 uses the first complete result AT THE LEVEL'S STRENGTH (never a depth-1 guess)
      - the answer is read from the level's depth, so a long think time does not quietly make 800 ELO play like 3200
      - a normal result is internally consistent (one settled depth)
      - every search has a finite UCI limit
      - auto-play has no extra pace wait: it thinks for the configured time, then dispatches
-     - checkmate style decides whether the shortest proven mate is taken; natural mistakes decide whether a low
-       level may swap its best line for another candidate
+     - checkmate style decides whether the shortest verified mate is taken; natural mistakes decide whether a low
+       level may swap its best line for another candidate or the hunter may spend its risk margin
+     - NO MISTAKES ARE ALLOWED: with Natural mistakes off - or at a zero-error level (2000+, Full engine) - no
+       style plays anything but the engine's best move, and a mate claim a deeper search refuted is never played
 */
 'use strict';
 const L = require('../lib.js');
@@ -280,13 +282,15 @@ eq(L.applyMove(L.fenBoardMap('r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1'), 'e1g1', nu
 eq(L.applyMove(L.fenBoardMap('4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1'), 'e5d6', 'd6').pieces.d5, undefined,
   'an en-passant capture removes the pawn that is not on the destination square');
 
-// ---- 11. the hunter's chosen move: pressure first, but only inside the risk it is allowed
+// ---- 11. the hunter's chosen move: pressure first, but only inside the risk it is allowed.
+// The risk dial is human-simulation: it is active with Natural mistakes ON at a below-2000 level (the
+// no-mistakes contract pins the other mode at the end of this file).
 const huntLines = [
   { move: 'e1e2', type: 'cp', score: 30, depth: 20 },     // best line, quiet
   { move: 'f3g5', type: 'cp', score: 25, depth: 20 },     // the bait
   { move: 'h1h8', type: 'cp', score: 20, depth: 20 }      // the check
 ];
-const hunt = (lines, opt) => L.chooseMove(lines, Object.assign({ mateMode: 'hunter', fen: HUNT_FEN, mistakes: false }, opt));
+const hunt = (lines, opt) => L.chooseMove(lines, Object.assign({ mateMode: 'hunter', fen: HUNT_FEN, mistakes: true, elo: 1200 }, opt));
 eq(hunt(huntLines, {}).uci, 'h1h8', 'the hunter plays the check over a slightly better quiet move (check > bait)');
 eq(hunt(huntLines, {}).hunt.check, true, 'and reports the check, so the panel can say why');
 eq(hunt(huntLines, {}).mate, null, 'no mate was proven, so nothing is claimed as one');
@@ -354,9 +358,12 @@ const shadowed = L.huntPool([{ move: 'd2d4', type: 'cp', score: 20, depth: 1 }],
 eq(shadowed[0].type, 'mate', 'a mate proof replaces the shallower score for the same move');
 eq(L.chooseMove(shadowed, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very' }).mate.score, 3,
   'so the hunter really plays it');
+// A shallow `score mate` a deeper iteration REFUTED is a mirage: the deeper score is the truth and the stale
+// claim is dropped - playing it would be a real mistake (the old "sticky mate" rule did exactly that).
 const keepMate = L.huntPool([{ move: 'h1h8', type: 'mate', score: 3, depth: 10 }],
   [{ move: 'h1h8', type: 'cp', score: 500, depth: 30 }]);
-eq(keepMate[0].type, 'mate', 'a proven mate is never dropped for a deeper line that only has a score');
+eq(keepMate[0].type, 'cp', 'a mate claim a deeper search refuted is dropped: the deeper score is the truth');
+eq(keepMate[0].depth, 30, 'and the refuting line is the one in the pool');
 eq(L.chooseMove(levelLines, { mateMode: 'shortest', fen: HUNT_FEN, mistakes: false }).uci, 'e1e2',
   'the other styles still answer from the level depth alone');
 eq(L.chooseMove(deepPool, { mateMode: 'hunter', fen: HUNT_FEN, huntRisk: 'very' }).uci, 'h1h8',
@@ -373,6 +380,63 @@ ok(L.continuationPressure(HUNT_FEN, sustained) >= 10, 'two follow-up checks rewa
 eq(hunt([huntLines[0], sustained, huntLines[2]], {}).uci, 'f3g5', 'continued attack outranks the one-off check');
 eq(L.continuationPressure(HUNT_FEN, { move: 'f3g5', pv: ['h1h8'] }), 0, 'mismatched PV is not scored');
 eq(hunt([huntLines[0], Object.assign({}, sustained, { score: -500 })], {}).uci, 'e1e2', 'continuation cannot bypass risk budget');
+
+// ---- 13. NO MISTAKES ARE ALLOWED: every checkmate style is held to the engine's best move.
+// Natural mistakes off - or a zero-error level (2000+, Full engine) - forbids slips AND hunter concessions;
+// only a verified forced mate may outrank the top line, and a refuted mate claim may never be played.
+eq(L.strictPlay({ mistakes: false, elo: 400 }), true, 'mistakes off is strict at every level');
+eq(L.strictPlay({ mistakes: true, elo: 400 }), false, 'a human level with mistakes on may simulate a human');
+eq(L.strictPlay({ mistakes: true, elo: 1800 }), false, '1800 keeps its small error rate, so its deviations stay');
+eq(L.strictPlay({ mistakes: true, elo: 2000 }), true, '2000+ has no error rate and never deviates');
+eq(L.strictPlay({ mistakes: true, elo: 3200 }), true, 'Full engine is the objectively best move in every style');
+eq(L.strictPlay(), true, 'no options means no deviations');
+eq(hunt(huntLines, { mistakes: false }).uci, 'e1e2',
+  'mistakes off: the hunter gives up NOTHING - the quiet best move stays');
+eq(hunt(huntLines, { mistakes: false }).mistake, false, 'and nothing is flagged as a slip');
+eq(hunt(huntLines, { mistakes: false, huntRisk: 'very' }).uci, 'e1e2',
+  'the risk dial is closed at zero with mistakes off, whatever it is set to');
+eq(hunt(huntLines, { elo: 3200, mistakes: true }).uci, 'e1e2',
+  'Full engine never spends the risk margin - even with mistakes on');
+eq(hunt(huntLines, { elo: 2500, mistakes: true, huntRisk: 'very' }).uci, 'e1e2', 'and neither does 2500');
+eq(hunt(huntLines, { elo: 1800, mistakes: true, huntRisk: 'very' }).uci, 'h1h8',
+  'a level with a real error rate may still attack at a cost - that is what the dial is for');
+eq(hunt([{ move: 'e1e2', type: 'cp', score: 30, depth: 20 }, { move: 'h1h8', type: 'cp', score: 30, depth: 20 }], { mistakes: false }).uci, 'h1h8',
+  'a strict hunter still takes an attack that TIES the best move - a tie is not a mistake');
+eq2(L.chooseMove(pickLines, { elo: 1200, mistakes: true, mateMode: 'normal', rand: () => 0.1 }), 'd2d4',
+  'the slip roll is unchanged where it is allowed (human level, mistakes on)');
+
+// verified mates only: a claim the deepest evidence refutes is never played, in every mate-seeking style
+const staleClaim = [
+  { move: 'e2e4', type: 'cp', score: 40, depth: 7 },
+  { move: 'd2d4', type: 'mate', score: 3, depth: 7 }        // "mate in 3" the deep search later refuted
+];
+const refuted = { move: 'd2d4', type: 'cp', score: -300, depth: 26 };
+eq2(L.chooseMove(staleClaim, { mateMode: 'shortest', mistakes: false, deepLines: [refuted] }), 'e2e4',
+  'fewest moves: a refuted mate claim is dropped and the top line plays');
+eq2(L.chooseMove(staleClaim, { mateMode: 'hunter', fen: HUNT_FEN, mistakes: true, elo: 1200, deepLines: [refuted] }), 'e2e4',
+  'the hunter never attacks on a refuted mate claim either');
+eq2(L.chooseMove(staleClaim, { mateMode: 'shortest', mistakes: false, deepLines: [] }), 'd2d4',
+  'without a refutation the claim still stands - only deeper evidence cancels a mate');
+eq(L.confirmedMateLines([staleClaim[1], refuted]).length, 0,
+  'confirmedMateLines: the deepest sighting is the verdict, and a non-mate verdict refutes the claim');
+eq(L.confirmedMateLines([staleClaim[1], { move: 'd2d4', type: 'mate', score: 5, depth: 26 }])[0].score, 5,
+  'a deeper confirmation carries its own mate distance');
+eq(L.confirmedMateLines([{ move: 'd2d4', type: 'cp', score: 10, depth: 7 }, { move: 'd2d4', type: 'mate', score: 2, depth: 26 }])[0].score, 2,
+  'a deep proof beats a shallow non-mate score for the same move');
+eq(L.confirmedMateLines([]).length, 0, 'no lines -> no mate claims');
+
+// ---- 14. instant strength floor: "first complete result" is only an answer AT THE LEVEL'S STRENGTH.
+// A depth-1 MultiPV set is a guess that hangs pieces - Full engine + Think time 0 must still play real moves.
+eq(typeof L.INSTANT_MIN_DEPTH, 'number', 'the full-strength instant floor is a named constant');
+eq(L.instantDepth(mpv3, 3, 3), null, 'a capped level never answers below its own read depth (800 ELO = depth 3)');
+eq(L.instantDepth({ 1: mpv3[1], 2: mpv3[2], 3: mpv3[3], 4: { 1: { move: 'e2e4' } } }, 3, 3), 3,
+  'once the engine has moved past the level depth, that depth is the answer (half-filled or forced)');
+eq(L.instantDepth(mpv3, 3, 2), 2, 'the floor is the level depth: the first complete set at or above it wins');
+eq(L.instantDepth(mpv3, 3, 1), 1, 'a 400 ELO level (depth 1) still answers immediately from depth 1');
+eq(L.instantDepth(mpv3, 3, L.INSTANT_MIN_DEPTH), null, 'Full engine + instant never answers before full-strength depth');
+const forced3 = { 1: forced[1], 2: forced[1], 3: forced[1] };   // two legal moves, three depths
+eq(L.instantDepth(forced3, 5, 2), 2, 'a forced position answers from a moved-past depth at or above the floor');
+eq(L.instantDepth(forced3, 5, 4), null, 'and still never below the floor');
 
 console.log((failures ? 'FAILED ' : 'OK ') + checks + ' checks, ' + failures + ' failures');
 process.exit(failures ? 1 : 0);
