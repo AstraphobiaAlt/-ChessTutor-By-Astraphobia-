@@ -333,9 +333,14 @@
   }
   /* Think time 0 has to still produce full-strength play. The first complete MultiPV set is depth 1, which
      hangs pieces to whatever the shallow search cannot see - and "Full engine" promises the objectively best
-     move. So an instant answer waits until the search has proved at least this deep before it stops (the
-     safety movetime is the outer bound for the search). Capped levels use their own depth as the floor. */
-  var INSTANT_MIN_DEPTH = 12;
+     move. So an instant answer is only ever taken AT MAX DEPTH: the floor is the deepest strength the panel
+     can express (40 = "no strength cap, play the deepest line"), which means an uncapped instant search is
+     never stopped early by the eager check - it runs at full speed to its natural end (the safety movetime is
+     the outer bound) and the answer is the deepest iteration reached. That is the most instant a max-depth
+     answer can be: no clock is added and nothing is waited for beyond the search itself - and it is the most
+     depth the window allows, so instant play makes no shallow mistakes. Capped levels use their own depth as
+     the floor. */
+  var INSTANT_MIN_DEPTH = 40;
 
   /* A UCI `score mate +N` is a mate for the side to move, and lower positive values are sooner.  MultiPV
      normally ranks this correctly already, but selecting it explicitly keeps auto-play's mate-first policy
