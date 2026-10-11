@@ -8,8 +8,10 @@ making real mistakes on Stockfish 19. Three holes, all closed:
     1. Instant was shallow. Think time 0 stopped the search at the engine's first complete MultiPV iteration -
        depth 1 - and played that, even at Full engine, so "the objectively best move" was a guess that hangs
        pieces. Now an instant answer waits for a complete result AT THE LEVEL'S STRENGTH: a capped level stops
-       at its own read depth, Full engine at full-strength depth (12+) or the safety window, whichever comes
-       first. Instant saves the think-time clock; it no longer replaces the engine with a shallow guess.
+       at its own read depth, and Full engine answers AT MAX DEPTH - the instant search is never stopped early,
+       it runs at full speed to the end of the safety window and plays the deepest iteration reached, so the
+       answer arrives the moment a max-depth result exists and no shallower one is ever played. Instant saves
+       the think-time clock; it no longer replaces the engine with a shallow guess.
     2. Stale mate claims. A "score mate +N" found by an early iteration used to stay a candidate even when a
        deeper iteration of the SAME move replaced it with a normal score - the shortest-mate and hunter styles
        would then play a mate that was never real, and game review calls that a mistake. Every mate proof is
@@ -228,8 +230,9 @@ It is one setting for both paths, and it is independent from the ELO level:
     5s at 2500 ELO   thinks 5s, plays the 2500 ELO lines
     5s at 800 ELO    thinks 5s too, then plays the move its depth-3 look produced
     0 (instant)      no clock at all: the search stops as soon as a complete result AT THE LEVEL'S STRENGTH
-                     exists - the level's own read depth, or full-strength depth (12+) for Full engine - so
-                     instant play is real play, not a depth-1 guess (see UPDATE 1.12)
+                     exists - the level's own read depth, or, for Full engine, max depth: the search runs at
+                     full speed to the end of the safety window and answers from the deepest iteration reached,
+                     so instant play is real play, not a depth-1 guess (see UPDATE 1.12)
 The slider moves in 0.1s steps, so anything from "instant" to a minute is available.
 
 That separation matters: the ELO level no longer cuts the search short. A level used to be a depth cap, so a

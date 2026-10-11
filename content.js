@@ -596,7 +596,9 @@
     // when the engine has moved past a depth that holds fewer lines than we asked for (a forced position has
     // fewer moves than MultiPV), because that depth is then as complete as it will ever be. The strength floor
     // keeps instant mode honest: a depth-1 MultiPV set is not "Full engine" play and blunders, so a capped level
-    // waits for its own read depth and an uncapped one (Full engine) for INSTANT_MIN_DEPTH - no mistakes.
+    // waits for its own read depth and an uncapped one (Full engine) for max depth (INSTANT_MIN_DEPTH) - the
+    // search then runs at full speed to its natural end and answers from the deepest iteration, so instant is
+    // as fast as a max-depth answer can be and never a shallow guess - no mistakes.
     eagerCheck() {
       const cur = this.cur;
       if (!cur || !cur.eager || cur.settled) return;
